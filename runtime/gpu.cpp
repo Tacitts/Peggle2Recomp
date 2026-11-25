@@ -224,6 +224,23 @@ namespace
             auto snap = std::make_shared<TextureSnapshot>();
             snap->address = t.address;
             snap->data.assign(p, p + bytes);
+            // Torn copies: the title may rewrite a texture while this frame's draws still read it
+            // (Bink decodes the next movie frame into a buffer the current frame also draws; a
+            // console GPU has finished reading by then, the GPU thread here may not have). If
+            // the memory changed during the copy, keep the previous complete copy for this frame
+            // and try again next frame - otherwise half-decoded rows show as coloured bars.
+            static uint64_t torn = 0;
+            bool changedDuringCopy = false;
+            for (size_t off = 0; off < bytes && !changedDuringCopy; off += 4096)
+                changedDuringCopy = memcmp(snap->data.data() + off, p + off, std::min<size_t>(4096, bytes - off)) != 0;
+            if (changedDuringCopy && e.snap)
+            {
+                if (++torn <= 5 || (torn % 500) == 0)
+                    Log("[gpu] texture %08X (%ux%u fmt %u) was being written while copied: kept the previous copy (%llu times)",
+                        t.address, t.width, t.height, t.format, (unsigned long long)torn);
+                e.copiedFrame = ~0ull;   // copy again next frame
+                return e.snap;
+            }
             e.snap = std::move(snap);
             e.sample = h;
         }
