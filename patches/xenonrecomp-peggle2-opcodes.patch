@@ -1,5 +1,5 @@
-﻿diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..59f5962 100644
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..078f802 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -263,7 +263,9 @@ bool Recompiler::Recompile(
@@ -293,3 +293,35 @@ index fa91527..59f5962 100644
  
      case PPC_INST_BEQ:
          printConditionalBranch(false, "eq");
+@@ -849,7 +1081,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // Ordering only (x86 keeps stores in order): stop the compiler from reordering.
++        println("	__atomic_signal_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -1209,7 +1442,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        // Load/store ordering, which x86 already guarantees except store->load (not ordered by
++        // lwsync either): only the compiler must not reorder across it.
++        println("	__atomic_signal_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1711,7 +1946,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        // Full barrier: x86 may reorder a store with a later load (store buffer), which sync
++        // forbids; lock-free code across threads relies on it. Also stops compiler reordering.
++        println("	__atomic_thread_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_TDLGEI:
