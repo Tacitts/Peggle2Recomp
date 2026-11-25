@@ -53,7 +53,7 @@ written by `xexdump --dump-image`.
 | 1c. Jump tables | Done. 197/197 bounds-checked tables resolved; 0 switch errors in the recompile. |
 | 1d. Function boundaries | Done. 25,066 `.pdata` functions, 17 leaf functions with tables bounded explicitly, exception-handler records skipped. |
 | 1e. PPC → C++ | Done. 33,820 functions in 134 files in `ppc/`. 0 unrecognized instructions, 0 error markers. (An earlier count of 34,268 included stale files from previous runs; always regenerate into an empty `ppc/`.) |
-| 2. Missing opcodes in XenonRecomp | Done. 48 opcodes added, plus two upstream fixes (see below). `lib/` compiles all generated code into `Peggle2Recomp.lib` (53 MB) with 0 errors and 0 warnings. Instruction semantics are **not yet tested at runtime**. |
+| 2. Missing opcodes in XenonRecomp | Done. 48 opcodes added, plus two upstream fixes (see below). `lib/` compiles all generated code into `Peggle2Recomp.lib` (53 MB) with 0 errors and 0 warnings. Instruction semantics **reviewed**: the C++ emitted for every added opcode was checked against the PowerPC/VMX definitions (lane order under byte-reversed vector storage, saturation, operand order of the packs, sign extension, update forms, carries, branch conditions); no errors found. Not executed as unit tests: Xenia's PPC tests need a PowerPC assembler (the Windows LLVM build has no PowerPC target). |
 | 3. Shaders (XenosRecomp) | Done for everything seen so far. Shaders are captured as raw microcode from the GPU command stream (`IM_LOAD` / `IM_LOAD_IMMEDIATE`) and translated at runtime: **9/9** (5 vertex, 4 pixel) cover the title, menus and the first level, and all compile. See 4h. |
 | 4a. Runtime skeleton | Done. `build/runtime/Peggle2.exe` boots the recompiled code natively: CRT init, XAM module lookups, file I/O, and into D3D/GPU initialisation. |
 | 4b. Threads + sync objects | Done. Real host threads per `ExCreateThread` (6 guest threads run: main, Wwise `AK::IOThread`/`AK::BankManager`, audio, 2 D3D workers), events, semaphores, mutants, timers, waits, spinlocks, object manager. |
@@ -300,4 +300,5 @@ GPU data through the `0xC0000000` alias. Built with placeholder reservations
 
 1. **Renderer gaps (4h):** depth buffer (mode 5 draws), indexed draws, other surface formats,
    resolves that the CPU reads back. Play further into the game to find shaders and draw types not seen yet.
-2. **Instruction tests:** run XenonRecomp's test suite to check the new opcodes.
+2. **Instruction tests (optional):** the added opcodes were reviewed by hand; running Xenia's PPC
+   tests through XenonTests would need a PowerPC assembler (binutils or an LLVM build with the PowerPC target).
