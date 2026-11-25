@@ -156,6 +156,45 @@ namespace
         out.push_back(std::move(vs));
     }
 
+    // Texture snapshots (see TextureSnapshot): reused while 64 sampled 16-byte spots of the
+    // footprint are unchanged, copied again otherwise. GPU thread only.
+    struct SnapshotEntry { uint64_t sample = 0; std::shared_ptr<const TextureSnapshot> snap; };
+    std::unordered_map<uint64_t, SnapshotEntry> g_snapshots;   // (address, size) -> latest copy
+
+    std::shared_ptr<const TextureSnapshot> SnapshotTexture(const uint32_t* f)
+    {
+        GuestTextureInfo t{};
+        uint32_t base = (f[1] >> 12) & 0xFFFFF;
+        if (!base) return nullptr;
+        t.address = 0xA0000000u | (base << 12);
+        t.width = (f[2] & 0x1FFF) + 1;
+        t.height = ((f[2] >> 13) & 0x1FFF) + 1;
+        t.pitch = ((f[0] >> 22) & 0x1FF) * 32;
+        t.tiled = (f[0] >> 31) & 1;
+        t.format = f[1] & 0x3F;
+        t.endian = (f[1] >> 6) & 3;
+        uint32_t bytes;
+        if (!GuestTextureFootprint(t, bytes) || !bytes) return nullptr;
+        if (uint64_t(t.address) + bytes > 0xC0000000ull) bytes = 0xC0000000u - t.address;
+        const uint8_t* p = GuestPtr(t.address);
+        uint64_t h = 1469598103934665603ull;
+        for (uint64_t i = 0; i < 64; i++)
+        {
+            uint64_t at = bytes > 16 ? (uint64_t(bytes) - 16) * i / 63 : 0;
+            for (int k = 0; k < 16 && at + k < bytes; k++) { h ^= p[at + k]; h *= 1099511628211ull; }
+        }
+        auto& e = g_snapshots[(uint64_t(t.address) << 32) | bytes];
+        if (!e.snap || e.sample != h)
+        {
+            auto snap = std::make_shared<TextureSnapshot>();
+            snap->address = t.address;
+            snap->data.assign(p, p + bytes);
+            e.snap = std::move(snap);
+            e.sample = h;
+        }
+        return e.snap;
+    }
+
     void RecordDraw(uint32_t initiator)
     {
         if (!g_curShader[0].hash || !g_curShader[1].hash) return;
@@ -178,6 +217,9 @@ namespace
         memcpy(rec->fetch, g_regs + xreg::FETCH_CONSTANTS, sizeof(rec->fetch));
         memcpy(rec->state, g_regs + xreg::STATE_BASE, sizeof(rec->state));
         const ShaderInfo& vsInfo = InfoFor(g_curShader[0], false);
+        uint32_t texSlots = vsInfo.textureSlotMask | InfoFor(g_curShader[1], true).textureSlotMask;
+        for (uint32_t slot = 0; slot < 32; slot++)
+            if (texSlots & (1u << slot)) rec->textures[slot] = SnapshotTexture(rec->fetch + slot * 6);
         uint32_t done[3] = {};
         for (const auto& e : vsInfo.vertexElements)
         {

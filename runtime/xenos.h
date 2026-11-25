@@ -72,6 +72,8 @@ struct VertexStream
     std::vector<uint8_t> data;
 };
 
+struct TextureSnapshot;   // see below
+
 // Everything needed to replay one draw on the host, captured when the GPU thread executes it.
 struct DrawRecord
 {
@@ -83,6 +85,7 @@ struct DrawRecord
     uint32_t fetch[32 * 6];
     uint32_t state[xreg::STATE_COUNT];
     std::vector<VertexStream> streams;
+    std::shared_ptr<const TextureSnapshot> textures[32];   // per texture fetch slot used by the shaders
     uint32_t Reg(uint32_t index) const { return state[index - xreg::STATE_BASE]; }
 };
 
@@ -107,4 +110,14 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
 
 // Texture decoding shared with the preview (render.cpp): mip 0 to BGRA8.
 struct GuestTextureInfo;
-bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out);
+bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot = nullptr, size_t snapshotSize = 0);
+bool GuestTextureFootprint(const GuestTextureInfo& t, uint32_t& bytes);
+
+// Texture memory copied when a draw is recorded (the title may overwrite it right after the
+// GPU signals the draw done, e.g. Bink's next movie frame). Shared between draws while the
+// memory is unchanged.
+struct TextureSnapshot
+{
+    uint32_t address = 0;              // guest address of mip 0
+    std::vector<uint8_t> data;         // the footprint, as in memory
+};

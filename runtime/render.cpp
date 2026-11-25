@@ -69,8 +69,24 @@ namespace
         for (int i = 0; i < 16; i++) out[i] = p[(bits >> (2 * i)) & 3];
     }
 
+    // Bytes per block and block size of the supported formats (false if unsupported).
+    bool FormatBlocks(uint32_t fmt, uint32_t& bpb, uint32_t& blockDim)
+    {
+        switch (fmt)
+        {
+        case 2: bpb = 1; blockDim = 1; return true;                     // 8
+        case 4: case 10: bpb = 2; blockDim = 1; return true;            // 5_6_5, 8_8
+        case 6: bpb = 4; blockDim = 1; return true;                     // 8_8_8_8
+        case 26: bpb = 8; blockDim = 1; return true;                    // 16_16_16_16
+        case 18: case 52: bpb = 8; blockDim = 4; return true;           // DXT1
+        case 19: case 20: case 53: case 54: bpb = 16; blockDim = 4; return true;   // DXT2/3, DXT4/5
+        default: return false;
+        }
+    }
+
     // Decode mip 0 of a texture into BGRA8 (w x h). Returns false for unsupported formats.
-    bool DecodeTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out)
+    // `snapshot` (optional): a copy of the texture's footprint taken when the draw was recorded.
+    bool DecodeTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot = nullptr, size_t snapshotSize = 0)
     {
         enum { k_8 = 2, k_5_6_5 = 4, k_8_8_8_8 = 6, k_8_8 = 10, k_DXT1 = 18, k_DXT2_3 = 19, k_DXT4_5 = 20, k_16_16_16_16 = 26,
                k_DXT1_AS_16 = 52, k_DXT2_3_AS_16 = 53, k_DXT4_5_AS_16 = 54 };
@@ -97,8 +113,17 @@ namespace
             {
                 uint32_t idx = t.tiled ? TiledOffset(bx, by, pitchBlocks, bpb) : by * pitchBlocks + bx;
                 uint64_t src = uint64_t(t.address) + uint64_t(idx) * bpb;
-                if (src + bpb > 0xC0000000ull) return false;   // stay inside the physical view
-                memcpy(block, GuestPtr(uint32_t(src)), bpb);
+                if (snapshot)
+                {
+                    size_t at = size_t(idx) * bpb;
+                    if (at + bpb <= snapshotSize) memcpy(block, snapshot + at, bpb);
+                    else memset(block, 0, bpb);
+                }
+                else
+                {
+                    if (src + bpb > 0xC0000000ull) return false;   // stay inside the physical view
+                    memcpy(block, GuestPtr(uint32_t(src)), bpb);
+                }
                 SwapBlock(block, std::max<uint32_t>(bpb, 4), t.endian);
                 if (blockDim == 1)
                 {
@@ -144,7 +169,24 @@ namespace
     }
 }
 
-bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out) { return DecodeTexture(t, out); }
+bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot, size_t snapshotSize)
+{
+    return DecodeTexture(t, out, snapshot, snapshotSize);
+}
+
+// Bytes of guest memory mip 0 occupies (tiled textures: width and height padded to 32 blocks).
+bool GuestTextureFootprint(const GuestTextureInfo& t, uint32_t& bytes)
+{
+    uint32_t bpb, blockDim;
+    if (!FormatBlocks(t.format, bpb, blockDim)) return false;
+    uint32_t bw = (t.width + blockDim - 1) / blockDim, bh = (t.height + blockDim - 1) / blockDim;
+    uint32_t pitchBlocks = std::max<uint32_t>((t.pitch ? t.pitch : t.width) / blockDim, bw);
+    if (t.tiled) { pitchBlocks = (pitchBlocks + 31) & ~31u; bh = (bh + 31) & ~31u; }
+    uint64_t b = uint64_t(pitchBlocks) * bh * bpb;
+    if (b > (64u << 20)) return false;
+    bytes = uint32_t(b);
+    return true;
+}
 
 #include "xenos.h"
 

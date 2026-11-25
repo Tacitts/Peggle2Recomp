@@ -64,7 +64,9 @@ namespace
     {
         ID3D12Resource* resource = nullptr;
         uint32_t cpuSrv = 0;
-        uint64_t contentHash = 0;
+        const TextureSnapshot* content = nullptr;      // snapshot this texture was decoded from
+        std::shared_ptr<const TextureSnapshot> keep;     // keeps `content` alive
+        uint64_t contentHash = 0;                        // live-memory fallback: sampled hash
         uint64_t lastFrame = 0;
     };
     std::unordered_map<std::string, CachedTexture> g_textures;
@@ -339,7 +341,8 @@ namespace
     }
 
     // CPU SRV index for the texture in fetch slot `f` (0 = dummy).
-    uint32_t TextureFor(ID3D12GraphicsCommandList* list, FrameResources& fr, const uint32_t* f)
+    uint32_t TextureFor(ID3D12GraphicsCommandList* list, FrameResources& fr, const uint32_t* f,
+                        const std::shared_ptr<const TextureSnapshot>& snap)
     {
         GuestTextureInfo t{};
         if (!DescribeTexture(f, t)) return 0;
@@ -348,15 +351,16 @@ namespace
         if (rit != g_resolved.end()) return ResolvedSrv(rit->second, swizzle);
         char key[96];
         snprintf(key, sizeof(key), "%08X %ux%u p%u f%u e%u t%u s%03X", t.address, t.width, t.height, t.pitch, t.format, t.endian, t.tiled, swizzle);
-        uint64_t content = SampleHash(t);
+        // Decode from the snapshot taken at record time (falls back to live memory).
+        const TextureSnapshot* content = snap && snap->address == t.address ? snap.get() : nullptr;
         auto it = g_textures.find(key);
-        if (it != g_textures.end() && it->second.contentHash == content)
+        if (it != g_textures.end() && (content ? it->second.content == content : it->second.contentHash == SampleHash(t)))
         {
             it->second.lastFrame = g_frameCounter;
             return it->second.cpuSrv;
         }
         std::vector<uint32_t> px;
-        if (!DecodeGuestTexture(t, px))
+        if (!DecodeGuestTexture(t, px, content ? content->data.data() : nullptr, content ? content->data.size() : 0))
         {
             static int logged = 0;
             if (logged++ < 20) Log("[draw] texture format %u (%ux%u) not decoded", t.format, t.width, t.height);
@@ -374,7 +378,9 @@ namespace
             else { tex->Release(); g_textures.erase(key); return 0; }
         }
         c.resource = tex;
-        c.contentHash = content;
+        c.content = content;
+        c.keep = content ? snap : nullptr;
+        c.contentHash = content ? 0 : SampleHash(t);
         c.lastFrame = g_frameCounter;
         g_dev->CreateShaderResourceView(tex, nullptr, CpuSrv(c.cpuSrv));
         return c.cpuSrv;
@@ -761,7 +767,7 @@ namespace
         for (uint32_t s = 0; s < kSlotsPerDraw; s++)
         {
             const uint32_t* f = d.fetch + s * 6;
-            uint32_t cpu = (used & (1u << s)) ? TextureFor(list, fr, f) : 0;
+            uint32_t cpu = (used & (1u << s)) ? TextureFor(list, fr, f, d.textures[s]) : 0;
             D3D12_CPU_DESCRIPTOR_HANDLE dst = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
             dst.ptr += SIZE_T(srvBase + s) * g_srvSize;
             g_dev->CopyDescriptorsSimple(1, dst, CpuSrv(cpu), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
