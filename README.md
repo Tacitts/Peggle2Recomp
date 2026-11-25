@@ -296,6 +296,6 @@ GPU data through the `0xC0000000` alias. Built with placeholder reservations
 
 1. **Renderer gaps (4h):** depth buffer (mode 5 draws), indexed draws, other surface formats,
    resolves that the CPU reads back. Play further into the game to find shaders and draw types not seen yet.
-2. **Audio output:** WASAPI from `XAudioSubmitRenderDriverFrame` (256 samples x 6 channels,
-   big-endian floats), and XMA decoding for the game's compressed sounds.
-4. **Instruction tests:** run XenonRecomp's test suite to check the new opcodes.
+2. **Audio check (4k):** listen to the menus and a level. XMA decodes and reaches the mix, but the menu mix
+   peaks at only ~0.04; if music or effects are too quiet or wrong, start from the per-context log lines.
+3. **Instruction tests:** run XenonRecomp's test suite to check the new opcodes.
