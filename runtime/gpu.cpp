@@ -10,11 +10,15 @@
 // (the physical allocator's range). Command buffers are big-endian dwords. Memory writes
 // carry an endian-swap mode in the low 2 address bits (0 none, 1 8in16, 2 8in32, 3 16in32).
 #include "runtime.h"
+#include "xenos.h"
 
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <map>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 
 namespace
 {
@@ -71,9 +75,146 @@ namespace
         }
     }
 
+    // ---- Shader microcode (IM_LOAD / IM_LOAD_IMMEDIATE) -------------------------------------------
+    // Every shader a draw uses reaches the GPU through these packets as raw microcode (big-endian
+    // dwords, no container), whichever way the game created it. The current vertex/pixel
+    // microcode is tracked here; each unique one is saved to build/runtime/microcode/.
+    struct LoadedShader
+    {
+        uint64_t hash = 0;
+        std::vector<uint32_t> words;   // as in memory (big-endian dwords)
+    };
+    LoadedShader g_curShader[2];       // 0 vertex, 1 pixel
+    std::mutex g_microcodeLock;
+    std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> g_microcode;
+
+    uint64_t Fnv1a(const void* data, size_t n)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t*)data)[i]; h *= 1099511628211ull; }
+        return h;
+    }
+
+    void LoadShader(uint32_t type, const uint32_t* beWords, uint32_t dwords)
+    {
+        type &= 1;
+        LoadedShader& s = g_curShader[type];
+        s.words.assign(beWords, beWords + dwords);
+        s.hash = Fnv1a(s.words.data(), s.words.size() * 4) ^ type;
+        std::lock_guard<std::mutex> g(g_microcodeLock);
+        if (g_microcode.count(s.hash)) return;
+        g_microcode[s.hash] = std::make_shared<const std::vector<uint32_t>>(s.words);
+        auto dir = UserDataDir().parent_path() / "microcode";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        char name[48];
+        snprintf(name, sizeof(name), "%s_%016llX.bin", type ? "ps" : "vs", (unsigned long long)s.hash);
+        if (FILE* f = fopen((dir / name).string().c_str(), "wb")) { fwrite(s.words.data(), 4, s.words.size(), f); fclose(f); }
+        Log("[gpu] shader microcode #%zu %s (%u dwords)", g_microcode.size(), name, dwords);
+    }
+
+    // ---- Draw records for the host renderer ------------------------------------------------------
+    // Each draw's state is copied on the GPU thread when the draw executes (registers and guest
+    // memory change right after), collected per frame, and handed to the renderer at the swap.
+    extern uint32_t g_regs[0x10000];
+    uint32_t PhysToGuest(uint32_t phys);
+    DrawList g_frameDrawList;
+    std::unordered_map<uint64_t, std::shared_ptr<const ShaderInfo>> g_shaderInfo;   // GPU thread only
+    constexpr uint32_t kSwapMarker = 0x53574150;   // 'SWAP': first payload dword of VdSwap's NOP
+
+    const ShaderInfo& InfoFor(const LoadedShader& s, bool pixel)
+    {
+        auto& slot = g_shaderInfo[s.hash];
+        if (!slot) slot = std::make_shared<const ShaderInfo>(AnalyzeShader(pixel, s.words));
+        return *slot;
+    }
+
+    void CopyVertexStream(uint32_t slot, uint32_t vertices, uint32_t strideDwords, std::vector<VertexStream>& out)
+    {
+        // Vertex fetch constant (2 dwords): dword0 type:2 address:30 (dwords), dword1 endian:2 size:24 (dwords).
+        const uint32_t* f = g_regs + xreg::FETCH_CONSTANTS + slot * 2;
+        uint32_t address = f[0] & ~3u, endian = f[1] & 3, sizeDwords = (f[1] >> 2) & 0xFFFFFF;
+        uint32_t want = std::max<uint32_t>(strideDwords, 1) * std::max<uint32_t>(vertices, 1) + 16;
+        uint32_t dwords = std::min({ sizeDwords ? sizeDwords : want, want, 1u << 20 });
+        VertexStream vs;
+        vs.fetchSlot = slot;
+        vs.data.resize(size_t(dwords) * 4);
+        const uint8_t* src = GuestPtr(PhysToGuest(address));
+        for (uint32_t i = 0; i < dwords; i++)
+        {
+            uint8_t b[4];
+            memcpy(b, src + i * 4, 4);
+            uint8_t* d = vs.data.data() + i * 4;
+            switch (endian)   // to little-endian, as the GPU would read it
+            {
+            case 1: d[0] = b[1]; d[1] = b[0]; d[2] = b[3]; d[3] = b[2]; break;   // 8in16
+            case 2: d[0] = b[3]; d[1] = b[2]; d[2] = b[1]; d[3] = b[0]; break;   // 8in32
+            case 3: d[0] = b[2]; d[1] = b[3]; d[2] = b[0]; d[3] = b[1]; break;   // 16in32
+            default: memcpy(d, b, 4); break;
+            }
+        }
+        out.push_back(std::move(vs));
+    }
+
+    void RecordDraw(uint32_t initiator)
+    {
+        if (!g_curShader[0].hash || !g_curShader[1].hash) return;
+        uint32_t source = (initiator >> 6) & 3;
+        if (source != 2) return;   // indexed draws: not seen in the menus yet
+        auto rec = std::make_shared<DrawRecord>();
+        rec->vsHash = g_curShader[0].hash;
+        rec->psHash = g_curShader[1].hash;
+        {
+            std::lock_guard<std::mutex> g(g_microcodeLock);
+            rec->vsCode = g_microcode[rec->vsHash];
+            rec->psCode = g_microcode[rec->psHash];
+        }
+        rec->prim = initiator & 0x3F;
+        rec->numIndices = initiator >> 16;
+        memcpy(rec->vsConsts, g_regs + xreg::ALU_CONSTANTS, sizeof(rec->vsConsts));
+        memcpy(rec->psConsts, g_regs + xreg::ALU_CONSTANTS + 0x400, sizeof(rec->psConsts));
+        memcpy(rec->bools, g_regs + xreg::BOOL_CONSTANTS, sizeof(rec->bools));
+        memcpy(rec->loops, g_regs + xreg::LOOP_CONSTANTS, sizeof(rec->loops));
+        memcpy(rec->fetch, g_regs + xreg::FETCH_CONSTANTS, sizeof(rec->fetch));
+        memcpy(rec->state, g_regs + xreg::STATE_BASE, sizeof(rec->state));
+        const ShaderInfo& vsInfo = InfoFor(g_curShader[0], false);
+        uint32_t done[3] = {};
+        for (const auto& e : vsInfo.vertexElements)
+        {
+            if (done[e.fetchSlot / 32] & (1u << (e.fetchSlot % 32))) continue;
+            done[e.fetchSlot / 32] |= 1u << (e.fetchSlot % 32);
+            CopyVertexStream(e.fetchSlot, rec->numIndices, e.strideDwords, rec->streams);
+        }
+        g_frameDrawList.push_back(std::move(rec));
+    }
+
+    // Draw summary (debugging aid): count of draws per {vs, ps, primitive, index source}.
+    struct DrawKind { uint64_t vs, ps; uint32_t prim, source, indexSize, packet2; };
+    std::mutex g_kindLock;
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> g_drawKinds;
+
+    void RecordDrawKind(uint32_t initiator, bool packet2)
+    {
+        // VGT_DRAW_INITIATOR: prim type bits 0-5, source select 6-7 (0 DMA, 1 immediate, 2 auto),
+        // index size bit 11 (0 16-bit, 1 32-bit), number of indices 16-31.
+        std::lock_guard<std::mutex> g(g_kindLock);
+        g_drawKinds[{ g_curShader[0].hash, g_curShader[1].hash, initiator & 0x3F, (initiator >> 6) & 3,
+                      (initiator >> 11) & 1, packet2 ? 1u : 0u }]++;
+    }
+
+    void DumpDrawKinds()
+    {
+        std::lock_guard<std::mutex> g(g_kindLock);
+        Log("[gpu] draw kinds so far (vs, ps, prim, source, 32-bit idx, DRAW_INDX_2): count");
+        for (auto& [k, n] : g_drawKinds)
+            Log("[gpu]   vs %016llX ps %016llX prim %u src %u idx32 %u p2 %u: %llu", (unsigned long long)std::get<0>(k),
+                (unsigned long long)std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), (unsigned long long)n);
+    }
+
     // PM4 type-3 opcodes
     enum : uint32_t
     {
+        PM4_IM_LOAD = 0x27, PM4_IM_LOAD_IMMEDIATE = 0x2B,
         PM4_DRAW_INDX = 0x22, PM4_DRAW_INDX_2 = 0x36,
         PM4_SET_CONSTANT = 0x2D, PM4_LOAD_ALU_CONSTANT = 0x2F, PM4_SET_CONSTANT2 = 0x55, PM4_SET_SHADER_CONSTANTS = 0x56,
         PM4_NOP = 0x10, PM4_REG_RMW = 0x21, PM4_INDIRECT_BUFFER_PFD = 0x37, PM4_WAIT_REG_MEM = 0x3C,
@@ -388,10 +529,36 @@ namespace
                 if (cpuMask & (1u << cpu)) CallInterrupt(1, cpu);
             break;
         }
+        case PM4_IM_LOAD:
+        {
+            // dword0: physical address | shader type (bits 0-1); dword1: start << 16 | size in dwords
+            uint32_t addrType = r.Read(), startSize = r.Read();
+            uint32_t dwords = startSize & 0xFFFF;
+            if (dwords) LoadShader(addrType & 3, (const uint32_t*)GuestPtr(PhysToGuest(addrType & ~3u)), dwords);
+            break;
+        }
+        case PM4_IM_LOAD_IMMEDIATE:
+        {
+            // dword0: shader type; dword1: start << 16 | size in dwords; then the microcode inline
+            uint32_t type = r.Read(), startSize = r.Read();
+            uint32_t dwords = std::min<uint32_t>(startSize & 0xFFFF, count - 2);
+            std::vector<uint32_t> words(dwords);
+            for (uint32_t i = 0; i < dwords; i++) words[i] = __builtin_bswap32(r.Read());   // back to memory order
+            if (dwords) LoadShader(type & 3, words.data(), dwords);
+            break;
+        }
         case PM4_DRAW_INDX:
         case PM4_DRAW_INDX_2:
-            OnDraw();   // not executed yet: record the textures it uses
+        {
+            // DRAW_INDX: dword0 viz query, dword1 VGT_DRAW_INITIATOR, [index base, index size].
+            // DRAW_INDX_2: dword0 VGT_DRAW_INITIATOR, then immediate indices.
+            if (opcode == PM4_DRAW_INDX) r.Read();
+            uint32_t initiator = r.Read();
+            RecordDrawKind(initiator, opcode == PM4_DRAW_INDX_2);
+            RecordDraw(initiator);
+            OnDraw();   // texture preview bookkeeping
             break;
+        }
         // Constant uploads. The type byte of SET_CONSTANT / LOAD_ALU_CONSTANT selects the
         // register block: 0 ALU 0x4000, 1 FETCH 0x4800, 2 BOOL 0x4900, 3 LOOP 0x4908, 4 REGS 0x2000.
         case PM4_SET_CONSTANT:
@@ -422,7 +589,15 @@ namespace
             for (uint32_t n = 0; n + 1 < count; n++) WriteRegister(index + n, r.Read());
             break;
         }
-        default:   // ME_INIT, NOP, EVENT_WRITE(_EXT/_ZPD), constants, state: skipped
+        case PM4_NOP:
+            // VdSwap's NOP carries a marker: the frame's draws are complete.
+            if (count >= 1 && r.Read() == kSwapMarker)
+            {
+                RendererSubmitDraws(std::move(g_frameDrawList));
+                g_frameDrawList = {};
+            }
+            break;
+        default:   // ME_INIT, EVENT_WRITE(_EXT/_ZPD), constants, state: skipped
             break;
         }
         // Consume whatever the handler did not read, so packets stay aligned.
@@ -668,6 +843,7 @@ IMPORT(VdSwap)
     {
         Store32(buf, (3u << 30) | ((63u - 1) << 16) | (PM4_NOP << 8));
         for (uint32_t i = 1; i < 64; i++) Store32(buf + i * 4, 0);
+        Store32(buf + 4, kSwapMarker);   // the GPU thread ends the frame's draw list here
     }
     uint32_t n = ++g_swaps;
     // Hand the frame's main texture to the renderer, then start a new frame.
@@ -688,5 +864,6 @@ IMPORT(VdSwap)
             best.tiled ? "tiled" : "linear", best.address);
     if (n == 300 || n == 1200) DumpShaderContainers();   // after loading screens have run
     if (n == 600) DumpPacketStats();
+    if (n == 600 || n == 3000) DumpDrawKinds();
     ctx.r3.u64 = 0;
 }

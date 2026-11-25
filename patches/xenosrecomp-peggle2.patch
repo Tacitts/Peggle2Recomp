@@ -1,20 +1,60 @@
-﻿diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..a5b6a3e 100644
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..deef714 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
-@@ -482,8 +482,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -170,6 +170,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+         ++indentation;
+     }
+ 
++    // A fetch whose destination components are all constant (0/1) or kept writes nothing from
++    // memory: emit only the constants (an empty swizzle would not compile).
++    bool fetchesAny = false;
++    for (uint32_t i = 0; i < 4; i++)
++    {
++        auto s = getDestSwizzle(instr.dstSwizzle, i);
++        fetchesAny |= s >= FetchDestinationSwizzle::X && s <= FetchDestinationSwizzle::W;
++    }
++    if (!fetchesAny)
++    {
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     indent();
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+@@ -263,6 +283,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+     else
+     {
++        // Not in the reflection table: name the fetch slot. RAW_SAMPLER_SLOTS (emitted with the
++        // raw constants) maps s<N>_*DescriptorIndex to slot N of the draw's descriptor tables.
+         constName = fmt::format("s{}", instr.constIndex);
+         constNamePtr = constName.c_str();
+     }
+@@ -482,8 +504,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                  }
                  else
                  {
-+                    // Not in the reflection table (Peggle 2 shaders do this): read the raw
-+                    // constant register file instead of an undeclared name.
-                     assert(!instr.const0Relative && !instr.const1Relative);
+-                    assert(!instr.const0Relative && !instr.const1Relative);
 -                    regFormatted = fmt::format("c{}", reg);
-+                    regFormatted = fmt::format("RAW_CONSTANT({})", reg);
++                    // Not in the reflection table (Peggle 2 shaders do this, and raw microcode
++                    // has no table at all): read the raw constant register file instead of an
++                    // undeclared name, with relative addressing (a0 / aL) when the instruction asks.
++                    if (instr.const0Relative)
++                        regFormatted = fmt::format("RAW_CONSTANT({} + {})", reg, instr.constAddressRegisterRelative ? "a0" : "aL");
++                    else
++                        regFormatted = fmt::format("RAW_CONSTANT({})", reg);
                  }
              }
  
-@@ -599,6 +601,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -599,6 +626,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              case ExportRegister::PSDepth:
                  exportRegister = "oDepth";
                  break;
@@ -26,7 +66,7 @@ index 698a418..a5b6a3e 100644
              }
          }
          else
-@@ -625,9 +632,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -625,9 +657,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
              default:
              {
@@ -39,7 +79,7 @@ index 698a418..a5b6a3e 100644
                  break;
              }
              }
-@@ -880,6 +888,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -880,6 +913,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
              break;
  
@@ -51,7 +91,7 @@ index 698a418..a5b6a3e 100644
          case AluScalarOpcode::Mins:
              print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
              break;
-@@ -1187,8 +1200,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1187,8 +1225,38 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -64,6 +104,18 @@ index 698a418..a5b6a3e 100644
 +
      out += "\n#else\n\n";
  
++    // Samplers missing from the reflection table (always the case for raw microcode): texture
++    // fetch slot N uses descriptor N of the draw's SRV and sampler tables.
++    for (uint32_t slot = 0; slot < 32; slot++)
++    {
++        if (samplers.count(slot))
++            continue;
++        for (const char* dim : { "1D", "2D", "3D", "Cube" })
++            println("#define s{}_Texture{}DescriptorIndex {}", slot, dim, slot);
++        println("#define s{}_SamplerDescriptorIndex {}", slot, slot);
++    }
++    out += "\n";
++
 +    // D3D12: a separate root CBV (b3, space4) with the stage's whole constant register file.
 +    out += "cbuffer RawShaderConstants : register(b3, space4)\n";
 +    out += "{\n";
@@ -78,7 +130,7 @@ index 698a418..a5b6a3e 100644
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
      out += "{\n";
  
-@@ -1418,7 +1449,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1418,7 +1486,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\n";
      }
  
@@ -87,7 +139,7 @@ index 698a418..a5b6a3e 100644
  
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
-@@ -1457,7 +1488,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1457,7 +1525,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\n";
      }
  
@@ -96,7 +148,7 @@ index 698a418..a5b6a3e 100644
      {
          if (!printedRegisters[i])
          {
-@@ -1483,6 +1514,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1483,6 +1551,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      out += "\tint aL = 0;\n";
      out += "\tbool p0 = false;\n";
      out += "\tfloat ps = 0.0;\n";
@@ -104,7 +156,7 @@ index 698a418..a5b6a3e 100644
      if (isPixelShader)
      {
  #ifdef UNLEASHED_RECOMP
-@@ -1648,7 +1680,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1648,7 +1717,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  #ifdef UNLEASHED_RECOMP
                      print("[unroll] ");
                  #endif
@@ -113,7 +165,7 @@ index 698a418..a5b6a3e 100644
                      indent();
                      out += "{\n";
                      ++indentation;
-@@ -1669,7 +1701,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1669,7 +1738,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  else
                  {
                      out += "\t\t\t++aL;\n";
@@ -122,7 +174,7 @@ index 698a418..a5b6a3e 100644
                      out += "\t\t\t{\n";
                      println("\t\t\t\tpc = {};", uint32_t(cfInstr.loopEnd.address));
                      out += "\t\t\t\tcontinue;\n";
-@@ -1698,7 +1730,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1698,7 +1767,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          if (findResult != boolConstants.end())
                              println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
                          else
@@ -131,7 +183,7 @@ index 698a418..a5b6a3e 100644
                      }
  
                      if (simpleControlFlow)
-@@ -1868,7 +1900,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1868,7 +1937,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          instrAddress += 12;
      }
  

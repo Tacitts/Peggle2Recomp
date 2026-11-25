@@ -141,6 +141,10 @@ namespace
     }
 }
 
+bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out) { return DecodeTexture(t, out); }
+
+#include "xenos.h"
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -182,6 +186,13 @@ namespace
     constexpr UINT kUploadPitch = kWidth * 4;
     std::vector<uint32_t> g_decoded;
     char g_previewDesc[96] = "none";
+
+    // Translated draws: the latest complete frame from the GPU thread (RendererSubmitDraws).
+    bool g_drawReady = false;
+    std::mutex g_drawsLock;
+    DrawList g_latestDraws;
+    uint32_t g_lastExecuted = 0;
+    const bool g_forcePreview = getenv("PEGGLE2_PREVIEW") != nullptr;
 
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
@@ -281,6 +292,8 @@ namespace
         g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         Log("[render] window + D3D12 swap chain ready (%ux%u)", kWidth, kHeight);
+        g_drawReady = DrawInit(g_device, kBuffers);
+        if (!g_drawReady) Log("[render] draw translation unavailable: showing the texture preview only");
         return true;
     }
 
@@ -376,8 +389,14 @@ namespace
             g_fence->SetEventOnCompletion(g_fenceValues[i], g_fenceEvent);
             WaitForSingleObject(g_fenceEvent, INFINITE);
         }
-        UINT pw, ph;
-        PreparePreview(i, preview, pw, ph);
+        DrawList draws;
+        if (g_drawReady && !g_forcePreview)
+        {
+            std::lock_guard<std::mutex> g(g_drawsLock);
+            draws = g_latestDraws;
+        }
+        UINT pw = 0, ph = 0;
+        if (draws.empty()) PreparePreview(i, preview, pw, ph);
         if (pw && ph && (frame == 300 || frame == 600 || frame == 1200 || frame == 2400))
         {
             char path[64];
@@ -400,7 +419,15 @@ namespace
         rtv.ptr += SIZE_T(i) * g_rtvSize;
         float pulse = 0.5f + 0.5f * float(sin(double(frame) * 0.05));
         const float color[4] = { 0.05f, 0.10f + 0.15f * pulse, 0.25f + 0.25f * pulse, 1.0f };
-        g_list->ClearRenderTargetView(rtv, color, 0, nullptr);
+        const float black[4] = { 0, 0, 0, 1 };
+        g_list->ClearRenderTargetView(rtv, draws.empty() ? color : black, 0, nullptr);
+        if (!draws.empty())
+        {
+            g_lastExecuted = DrawFrame(g_list, rtv.ptr, kWidth, kHeight, draws, i);
+            snprintf(g_previewDesc, sizeof(g_previewDesc), "%u/%zu draws", g_lastExecuted, draws.size());
+            if (frame == 600 || frame == 1200 || frame == 2400 || frame == 3600)
+                Log("[render] frame %llu: %u of %zu draws executed", (unsigned long long)frame, g_lastExecuted, draws.size());
+        }
 
         if (pw && ph)
         {
@@ -462,7 +489,7 @@ namespace
             {
                 double secs = std::chrono::duration<double>(now - lastTitle).count();
                 wchar_t title[160];
-                swprintf(title, 160, L"Peggle 2 (recomp)  -  frame %llu  -  %.0f fps  -  texture preview: %hs (draws not translated yet)",
+                swprintf(title, 160, L"Peggle 2 (recomp)  -  frame %llu  -  %.0f fps  -  %hs",
                          (unsigned long long)frame, double(frame - lastFrames) / secs, g_previewDesc);
                 SetWindowTextW(g_hwnd, title);
                 lastTitle = now;
@@ -470,6 +497,12 @@ namespace
             }
         }
     }
+}
+
+void RendererSubmitDraws(DrawList&& draws)
+{
+    std::lock_guard<std::mutex> g(g_drawsLock);
+    g_latestDraws = std::move(draws);
 }
 
 void StartRenderer()
