@@ -3,14 +3,93 @@
 // The console's audio driver calls every registered render-driver client once per
 // 256-sample frame (48 kHz -> every 5.33 ms) from its own thread; the client mixes and
 // hands back a frame with XAudioSubmitRenderDriverFrame. Here a dedicated guest thread does
-// the calling and submitted frames are discarded (silent output) until a host audio
-// backend exists.
+// the calling; the frames of all clients for one tick are summed, downmixed to stereo and
+// played through WASAPI (shared mode, Windows converts the rate if the device isn't 48 kHz).
 #include "runtime.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+
+// ---- Host output (WASAPI) ------------------------------------------------------------------------
+namespace
+{
+    constexpr uint32_t kRate = 48000, kFrameSamples = 256, kGuestChannels = 6;
+    std::mutex g_outLock;
+    std::deque<float> g_out;                     // interleaved stereo, waiting for the device
+    constexpr size_t kMaxQueued = kRate / 5 * 2; // 200 ms: beyond this, drop the oldest samples
+    std::atomic<float> g_peak{ 0 };
+
+    void PushStereo(const float* lr, size_t frames)
+    {
+        std::lock_guard<std::mutex> g(g_outLock);
+        g_out.insert(g_out.end(), lr, lr + frames * 2);
+        while (g_out.size() > kMaxQueued) g_out.pop_front();
+    }
+
+    void WasapiThread()
+    {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IMMDeviceEnumerator* en = nullptr;
+        IMMDevice* dev = nullptr;
+        IAudioClient* client = nullptr;
+        IAudioRenderClient* render = nullptr;
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        WAVEFORMATEX wf{};
+        wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        wf.nChannels = 2;
+        wf.nSamplesPerSec = kRate;
+        wf.wBitsPerSample = 32;
+        wf.nBlockAlign = 8;
+        wf.nAvgBytesPerSec = kRate * 8;
+        UINT32 bufferFrames = 0;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) ||
+            FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) ||
+            FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) ||
+            FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      400000 /* 40 ms */, 0, &wf, nullptr)) ||
+            FAILED(client->SetEventHandle(ev)) ||
+            FAILED(client->GetBufferSize(&bufferFrames)) ||
+            FAILED(client->GetService(IID_PPV_ARGS(&render))) ||
+            FAILED(client->Start()))
+        {
+            Log("[audio] WASAPI output unavailable: sound is discarded");
+            return;
+        }
+        Log("[audio] WASAPI output started (48 kHz stereo, %u-frame buffer)", bufferFrames);
+        for (;;)
+        {
+            WaitForSingleObject(ev, 100);
+            UINT32 padding = 0;
+            if (FAILED(client->GetCurrentPadding(&padding))) continue;
+            UINT32 free = bufferFrames - padding;
+            if (!free) continue;
+            BYTE* data = nullptr;
+            if (FAILED(render->GetBuffer(free, &data))) continue;
+            float* out = (float*)data;
+            size_t have;
+            {
+                std::lock_guard<std::mutex> g(g_outLock);
+                have = std::min<size_t>(g_out.size() / 2, free);
+                for (size_t i = 0; i < have * 2; i++) out[i] = g_out[i];
+                g_out.erase(g_out.begin(), g_out.begin() + have * 2);
+            }
+            for (size_t i = have * 2; i < size_t(free) * 2; i++) out[i] = 0.0f;   // underrun: silence
+            render->ReleaseBuffer(free, 0);
+        }
+    }
+}
 
 namespace
 {
@@ -21,6 +100,34 @@ namespace
     std::vector<Client> g_clients;
     std::once_flag g_threadOnce;
     std::atomic<uint64_t> g_framesRequested{ 0 }, g_framesSubmitted{ 0 };
+    // Sum of the frames the clients submitted during the current tick (planar, 6 x 256).
+    std::mutex g_mixLock;
+    float g_mix[kGuestChannels * kFrameSamples];
+    bool g_mixHasData = false;
+
+    // Flush one tick: 6 channels (FL FR FC LFE BL BR) -> stereo, to the WASAPI queue.
+    void FlushTick()
+    {
+        float lr[kFrameSamples * 2];
+        float peak = 0;
+        {
+            std::lock_guard<std::mutex> g(g_mixLock);
+            for (uint32_t i = 0; i < kFrameSamples; i++)
+            {
+                const float* c = g_mix;
+                float fl = c[0 * kFrameSamples + i], fr = c[1 * kFrameSamples + i], fc = c[2 * kFrameSamples + i];
+                float bl = c[4 * kFrameSamples + i], br = c[5 * kFrameSamples + i];
+                float l = fl + 0.7071f * (fc + bl), r = fr + 0.7071f * (fc + br);
+                lr[i * 2] = std::clamp(l, -1.0f, 1.0f);
+                lr[i * 2 + 1] = std::clamp(r, -1.0f, 1.0f);
+                peak = std::max({ peak, std::fabs(l), std::fabs(r) });
+            }
+            std::fill(std::begin(g_mix), std::end(g_mix), 0.0f);
+            g_mixHasData = false;
+        }
+        if (peak > g_peak.load()) g_peak = peak;
+        PushStereo(lr, kFrameSamples);
+    }
 
     constexpr uint32_t kDriverMagic = 0x41550000;
     constexpr auto kFramePeriod = std::chrono::nanoseconds(1'000'000'000ll * 256 / 48000);
@@ -30,7 +137,9 @@ namespace
         PPCContext ctx{};
         InitGuestThread(ctx, 0x10000, 0xA0D10);   // runtime-owned "audio driver" thread
         Log("[audio] driver thread started (frame every %.2f ms)", kFramePeriod.count() / 1e6);
+        std::thread(WasapiThread).detach();
         auto next = std::chrono::steady_clock::now();
+        auto nextPeakLog = next + std::chrono::seconds(10);
         for (;;)
         {
             next += kFramePeriod;
@@ -46,6 +155,12 @@ namespace
                 call.r3.u64 = c.argCell;
                 CallGuest(call, c.callback);
                 g_framesRequested++;
+            }
+            FlushTick();
+            if (std::chrono::steady_clock::now() >= nextPeakLog)
+            {
+                nextPeakLog += std::chrono::seconds(10);
+                Log("[audio] peak level over the last 10 s: %.3f", g_peak.exchange(0.0f));
             }
             // Log on crossing thresholds (several clients advance the counter per tick).
             static uint64_t lastBucket = 0;
@@ -91,10 +206,22 @@ IMPORT(XAudioUnregisterRenderDriverClient)
     ctx.r3.u64 = 0;
 }
 
-// XAudioSubmitRenderDriverFrame(u32 driver, f32* samples /* 256 x 6 channels, big-endian */)
+// XAudioSubmitRenderDriverFrame(u32 driver, f32* samples /* 6 channels x 256, planar, big-endian */)
 IMPORT(XAudioSubmitRenderDriverFrame)
 {
     g_framesSubmitted++;
+    if (uint32_t p = ctx.r4.u32)
+    {
+        std::lock_guard<std::mutex> g(g_mixLock);
+        for (uint32_t i = 0; i < kGuestChannels * kFrameSamples; i++)
+        {
+            uint32_t bits = Load32(p + i * 4);
+            float f;
+            memcpy(&f, &bits, 4);
+            if (std::isfinite(f)) g_mix[i] += f;
+        }
+        g_mixHasData = true;
+    }
     ctx.r3.u64 = 0;
 }
 
