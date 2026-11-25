@@ -231,8 +231,17 @@ namespace
             // and try again next frame - otherwise half-decoded rows show as coloured bars.
             static uint64_t torn = 0;
             bool changedDuringCopy = false;
-            for (size_t off = 0; off < bytes && !changedDuringCopy; off += 4096)
-                changedDuringCopy = memcmp(snap->data.data() + off, p + off, std::min<size_t>(4096, bytes - off)) != 0;
+            // Retry a few times first: the writer often finishes within a millisecond, and a
+            // texture seen for the first time (a movie that just started) has no previous copy.
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                changedDuringCopy = false;
+                for (size_t off = 0; off < bytes && !changedDuringCopy; off += 4096)
+                    changedDuringCopy = memcmp(snap->data.data() + off, p + off, std::min<size_t>(4096, bytes - off)) != 0;
+                if (!changedDuringCopy) break;
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                snap->data.assign(p, p + bytes);
+            }
             if (changedDuringCopy && e.snap)
             {
                 if (++torn <= 5 || (torn % 500) == 0)
