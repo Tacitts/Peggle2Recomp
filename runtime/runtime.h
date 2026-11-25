@@ -132,6 +132,12 @@ void InitImports(const uint8_t* xexFile, size_t xexSize);   // fills IAT + varia
 // ---- Kernel objects ------------------------------------------------------------------
 extern std::filesystem::path g_gameDir;
 
+// Host directory for writable guest data (<exe dir>/userdata), and content roots mounted by
+// XamContentCreateEx: guest "<root>:\..." then maps to `dir` (fs.cpp).
+std::filesystem::path UserDataDir();
+void MountContentRoot(const std::string& root, const std::filesystem::path& dir);
+bool UnmountContentRoot(const std::string& root);
+
 struct KernelObject
 {
     virtual ~KernelObject() = default;

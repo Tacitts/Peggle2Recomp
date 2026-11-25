@@ -65,7 +65,7 @@ struct FileObject : KernelObject
     ~FileObject() override { if (host != INVALID_HANDLE_VALUE) ::CloseHandle(host); }
 };
 
-static fs::path UserDataDir()
+fs::path UserDataDir()
 {
     char exe[MAX_PATH];
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -73,6 +73,32 @@ static fs::path UserDataDir()
 }
 
 static std::string LowerStr(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
+
+// Content roots opened by XamContentCreateEx ("save:" -> userdata/content/...). Checked
+// before the default <drive> -> userdata/<drive> mapping.
+static std::mutex g_mountLock;
+static std::unordered_map<std::string, fs::path> g_mounts;   // lower-case root name -> host dir
+
+void MountContentRoot(const std::string& root, const fs::path& dir)
+{
+    std::lock_guard<std::mutex> g(g_mountLock);
+    g_mounts[LowerStr(root)] = dir;
+}
+
+bool UnmountContentRoot(const std::string& root)
+{
+    std::lock_guard<std::mutex> g(g_mountLock);
+    return g_mounts.erase(LowerStr(root)) != 0;
+}
+
+static bool LookupMount(const std::string& lowerRoot, fs::path* dir)
+{
+    std::lock_guard<std::mutex> g(g_mountLock);
+    auto it = g_mounts.find(lowerRoot);
+    if (it == g_mounts.end()) return false;
+    *dir = it->second;
+    return true;
+}
 
 // Translate a guest path to a host path. Returns empty on unknown device.
 static fs::path MapGuestPath(const std::string& guest, bool* readOnly)
@@ -100,7 +126,9 @@ static fs::path MapGuestPath(const std::string& guest, bool* readOnly)
         std::string drive = LowerStr(p.substr(0, colon));
         std::string rest = p.substr(colon + 1);
         while (!rest.empty() && rest[0] == '\\') rest.erase(0, 1);
-        fs::path dir = UserDataDir() / drive;
+        fs::path dir;
+        if (!LookupMount(drive, &dir))
+            dir = UserDataDir() / drive;
         std::error_code ec;
         fs::create_directories(dir, ec);
         return rest.empty() ? dir : dir / rest;

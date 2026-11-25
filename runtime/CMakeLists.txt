@@ -19,6 +19,7 @@ add_executable(Peggle2
     audio.cpp
     hooks.cpp
     xam.cpp
+    content.cpp
     net.cpp
     input.cpp
     render.cpp

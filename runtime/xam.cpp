@@ -17,7 +17,8 @@ uint32_t CompleteOverlapped(uint32_t ov, uint32_t result, uint32_t length)
     if (!ov) return result;
     Store32(ov + 0x00, result);
     Store32(ov + 0x04, length);
-    Store32(ov + 0x18, result);
+    // Extended error: HRESULT_FROM_WIN32(result), as XGetOverlappedExtendedError reports it.
+    Store32(ov + 0x18, result ? (0x80070000u | (result & 0xFFFF)) : 0);
     if (uint32_t routine = Load32(ov + 0x10))
         Log("[xam] overlapped completion routine 0x%08X not called (APCs not implemented)", routine);
     if (uint32_t ev = Load32(ov + 0x0C)) SignalHandle(ev);
