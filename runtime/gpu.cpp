@@ -731,6 +731,7 @@ namespace
 
     void GpuThread()
     {
+        NameHostThread("gpu");
         PublishDisplayRegisters();
         InitGuestThread(g_gpuCtx, 0x10000, 0x6B0);   // runtime-owned "GPU" thread
         g_nextVblank = std::chrono::steady_clock::now();

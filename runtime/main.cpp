@@ -16,6 +16,9 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
+#include <timeapi.h>
+#include <thread>
 #include <unordered_map>
 
 PPC_EXTERN_FUNC(_xstart);
@@ -307,6 +310,141 @@ static void RotateLogs()
     for (size_t i = 0; i + 10 < old.size(); i++) fs::remove(old[i], ec);
 }
 
+// ---- Thread names and the sampling profiler (PEGGLE2_PROFILE=start,seconds) ------------------
+void NameHostThread(const char* fmt, ...)
+{
+    char buf[128];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    wchar_t w[128];
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, w, 128);
+    SetThreadDescription(GetCurrentThread(), w);
+}
+
+// Samples every thread of the process about once a millisecond (suspend, read RIP, resume) and
+// logs, per thread, the share of samples per function: guest functions show as sub_XXXXXXXX,
+// waits as the system call they sit in. The window title (with fps) is logged at both ends.
+struct ProfThread { HANDLE h = nullptr; std::string name; std::unordered_map<uint64_t, uint32_t> rips; uint64_t samples = 0; };
+
+static std::string OwnWindowTitle()
+{
+    struct P { DWORD pid; char title[256]; } p{ GetCurrentProcessId(), "" };
+    EnumWindows([](HWND w, LPARAM l) -> BOOL {
+        auto* p = (P*)l;
+        DWORD wp = 0;
+        GetWindowThreadProcessId(w, &wp);
+        if (wp == p->pid && IsWindowVisible(w)) { GetWindowTextA(w, p->title, sizeof(p->title)); return FALSE; }
+        return TRUE;
+    }, (LPARAM)&p);
+    return std::string(p.title);
+}
+
+static void ProfilerThread(double startSeconds, double seconds)
+{
+    NameHostThread("profiler");
+    Sleep(DWORD(startSeconds * 1000));
+    std::unordered_map<DWORD, ProfThread> threads;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    auto refresh = [&] {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+        {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || threads.count(te.th32ThreadID)) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            ProfThread& t = threads[te.th32ThreadID];
+            t.h = h;
+            PWSTR d = nullptr;
+            char name[128] = "";
+            if (SUCCEEDED(GetThreadDescription(h, &d)) && d)
+            {
+                WideCharToMultiByte(CP_UTF8, 0, d, -1, name, sizeof(name), nullptr, nullptr);
+                LocalFree(d);
+            }
+            t.name = name[0] ? name : ("host " + std::to_string(te.th32ThreadID));
+        }
+        CloseHandle(snap);
+    };
+    Log("[profile] start (%.0f s), window: %s", seconds, OwnWindowTitle().c_str());
+    timeBeginPeriod(1);
+    LARGE_INTEGER f, t0, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    uint64_t rounds = 0;
+    std::vector<std::pair<ProfThread*, uint64_t>> got;
+    got.reserve(256);
+    do
+    {
+        if (rounds++ % 500 == 0) refresh();
+        got.clear();
+        for (auto& [id, t] : threads)
+        {
+            if (SuspendThread(t.h) == DWORD(-1)) continue;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL;
+            BOOL ok = GetThreadContext(t.h, &c);
+            ResumeThread(t.h);
+            if (ok) got.push_back({ &t, c.Rip });   // no allocation while a thread is suspended
+        }
+        for (auto& [t, rip] : got) { t->rips[rip]++; t->samples++; }
+        Sleep(1);
+        QueryPerformanceCounter(&now);
+    } while (double(now.QuadPart - t0.QuadPart) / f.QuadPart < seconds);
+    timeEndPeriod(1);
+    Log("[profile] %llu rounds, window: %s", (unsigned long long)rounds, OwnWindowTitle().c_str());
+
+    {
+        std::lock_guard<std::mutex> g(g_symLock);
+        if (!g_symReady)
+        {
+            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+            g_symReady = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+        }
+    }
+    std::unordered_map<uint64_t, std::string> symCache;
+    auto symName = [&](uint64_t rip) -> std::string {
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+        auto* si = (SYMBOL_INFO*)buf;
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        std::lock_guard<std::mutex> g(g_symLock);
+        IMAGEHLP_MODULE64 mi{};
+        mi.SizeOfStruct = sizeof(mi);
+        std::string mod = SymGetModuleInfo64(GetCurrentProcess(), rip, &mi) ? std::string(mi.ModuleName) + "!" : "?!";
+        if (SymFromAddr(GetCurrentProcess(), rip, &disp, si)) return mod + si->Name;
+        char b[32];
+        snprintf(b, sizeof(b), "%llX", (unsigned long long)rip);
+        return mod + b;
+    };
+    std::vector<ProfThread*> order;
+    for (auto& [id, t] : threads) order.push_back(&t);
+    std::sort(order.begin(), order.end(), [](ProfThread* a, ProfThread* b) { return a->name < b->name; });
+    for (ProfThread* t : order)
+    {
+        if (!t->samples) continue;
+        std::unordered_map<std::string, uint64_t> byFunc;
+        for (auto& [rip, n] : t->rips)
+        {
+            auto it = symCache.find(rip);
+            if (it == symCache.end()) it = symCache.emplace(rip, symName(rip)).first;
+            byFunc[it->second] += n;
+        }
+        std::vector<std::pair<uint64_t, std::string>> top;
+        for (auto& [name, n] : byFunc) top.push_back({ n, name });
+        std::sort(top.rbegin(), top.rend());
+        std::string line;
+        for (size_t i = 0; i < top.size() && i < 12; i++)
+        {
+            char b[320];
+            snprintf(b, sizeof(b), "%s%.1f%% %s", i ? ", " : "", 100.0 * top[i].first / t->samples, top[i].second.c_str());
+            line += b;
+        }
+        Log("[profile] %-26s %6llu: %s", t->name.c_str(), (unsigned long long)t->samples, line.c_str());
+    }
+}
+
 int main(int argc, char** argv)
 {
     RotateLogs();
@@ -360,6 +498,11 @@ int main(int argc, char** argv)
         if (!FuncSlot(uint32_t(a))) { FuncSlot(uint32_t(a)) = MissingFunctionTrap; traps++; }
     Log("[boot] %zu recompiled functions registered (%zu other code addresses trap)", mapped, traps);
     BuildHostToGuest();
+    if (const char* p = getenv("PEGGLE2_PROFILE"))   // "start,seconds": sample all threads
+    {
+        double start = atof(p), secs = strchr(p, ',') ? atof(strchr(p, ',') + 1) : 20;
+        std::thread(ProfilerThread, start, secs).detach();
+    }
 
     // Hardware register windows (GPU at 0x7FC80000, XMA at 0x7FEA0000, ...). D3D and the
     // audio driver touch these directly. For now they are plain zeroed memory: no hardware

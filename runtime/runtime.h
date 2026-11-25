@@ -85,6 +85,7 @@ extern thread_local uint32_t t_kthread;          // guest KTHREAD of the current
 
 // ---- Logging -------------------------------------------------------------------------
 void Log(const char* fmt, ...);
+void NameHostThread(const char* fmt, ...);   // thread description (debuggers, PEGGLE2_PROFILE)
 extern thread_local const char* g_lastImport;
 // Guest object the current thread is blocked on (0 when not waiting); read by the watchdog.
 extern thread_local std::atomic<uint32_t> t_waitingOn;

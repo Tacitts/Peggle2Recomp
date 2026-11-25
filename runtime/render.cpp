@@ -675,6 +675,7 @@ namespace
 
     void RenderThread()
     {
+        NameHostThread("render");
         if (!CreateWindowAndDevice()) return;
         g_ready = true;
         auto lastTitle = std::chrono::steady_clock::now();

@@ -434,6 +434,7 @@ static void ThreadMain(std::shared_ptr<ThreadObject> t)
         t->suspendCv.wait(lk, [&] { return t->suspendCount <= 0; });
     }
     PPCContext ctx{};
+    NameHostThread("guest %u (0x%08X)", t->threadId, t->startAddress);
     InitGuestThread(ctx, t->stackSize, t->threadId, t->guest);
     Log("[thread %u] start 0x%08X(ctx 0x%08X)%s", t->threadId, t->startAddress, t->startContext,
         t->xapiStartup ? " via XAPI startup" : "");

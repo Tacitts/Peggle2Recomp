@@ -39,6 +39,7 @@ namespace
 
     void WasapiThread()
     {
+        NameHostThread("wasapi");
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IMMDeviceEnumerator* en = nullptr;
         IMMDevice* dev = nullptr;
@@ -137,6 +138,7 @@ namespace
 
     void AudioThread()
     {
+        NameHostThread("audio");
         PPCContext ctx{};
         InitGuestThread(ctx, 0x10000, 0xA0D10);   // runtime-owned "audio driver" thread
         Log("[audio] driver thread started (frame every %.2f ms)", kFramePeriod.count() / 1e6);
