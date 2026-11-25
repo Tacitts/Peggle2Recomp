@@ -1,0 +1,22 @@
+# Never commit anything derived from the game. Users supply their own copy.
+# extracted package: Default.xex, main.rsb, art, audio
+/game/
+# C++ generated from the game's executable
+/ppc/
+# decrypted image, compiled exe, logs, captured shaders, user data
+/build/
+
+# Generated from the game by tools/gen_imports.py and tools/jumptables (regenerate locally)
+/runtime/generated/
+/config/peggle2.toml
+/config/peggle2_switch_tables.toml
+/config/peggle2_functions.toml
+
+# Third-party tools: clone them and apply patches/ (see README)
+/third_party/
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db

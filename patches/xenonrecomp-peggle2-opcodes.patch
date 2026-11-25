@@ -1,0 +1,295 @@
+﻿diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..59f5962 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -263,7 +263,9 @@ bool Recompiler::Recompile(
+     RecompilerLocalVariables& localVariables,
+     CSRState& csrState)
+ {
+-    println("\t// {} {}", insn.opcode->name, insn.op_str);
++    // Guest address first: the runtime maps a host crash address to a source line (PDB) and
++    // reads the guest instruction address from this comment.
++    println("\t// {:08X} {} {}", base, insn.opcode->name, insn.op_str);
+ 
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+@@ -523,8 +525,250 @@ bool Recompiler::Recompile(
+     if (id == PPC_INST_VUPKHSB128 && insn.operands[2] == 0x60) id = PPC_INST_VUPKHSH128;
+     else if (id == PPC_INST_VUPKLSB128 && insn.operands[2] == 0x60) id = PPC_INST_VUPKLSH128;
+ 
++    // ---- Peggle 2 additions: opcodes missing upstream -----------------------------------
++    // Helpers for the additions below.
++    auto crBit = [&](uint32_t bi)
++        {
++            constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++            return fmt::format("{}.{}", cr(bi / 4), fields[bi % 4]);
++        };
++    auto printUpdateD = [&](const char* body)
++        {
++            // D-form update: operands = rD/rS, disp, rA. ea = rA + disp; ...; rA = ea
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++            println(fmt::runtime(body), ea());
++            println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        };
++    auto printUpdateX = [&](const char* body)
++        {
++            // X-form update: operands = rD/rS, rA, rB. ea = rA + rB; ...; rA = ea
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++            println(fmt::runtime(body), ea());
++            println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        };
++    // CTR-decrementing conditional branch. A target outside the current function is a
++    // tail call (upstream emitted a goto to a label that doesn't exist there).
++    auto printCtrBranch = [&](const std::string& cond, uint32_t target)
++        {
++            println("\t--{}.u64;", ctr());
++            if (target < fn.base || target >= fn.base + fn.size)
++            {
++                println("\tif ({}) {{", cond);
++                print("\t");
++                printFunctionCall(target);
++                println("\t\treturn;");
++                println("\t}}");
++            }
++            else
++            {
++                println("\tif ({}) goto loc_{:X};", cond, target);
++            }
++        };
++    auto vecBinary = [&](const char* intrinsic)
++        {
++            println("\tsimde_mm_store_si128((simde__m128i*){}.u8, {}(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));",
++                v(insn.operands[0]), intrinsic, v(insn.operands[1]), v(insn.operands[2]));
++        };
++
+     switch (id)
+     {
++    // Branches
++    case PPC_INST_BDZF:
++        printCtrBranch(fmt::format("{}.u32 == 0 && !{}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BDNZT:
++        printCtrBranch(fmt::format("{}.u32 != 0 && {}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BDZ:
++        printCtrBranch(fmt::format("{}.u32 == 0", ctr()), insn.operands[0]);
++        break;
++
++    case PPC_INST_BDNZ:
++        printCtrBranch(fmt::format("{}.u32 != 0", ctr()), insn.operands[0]);
++        break;
++
++    case PPC_INST_BDNZF:
++        // Upstream hard-coded the eq bit here; use the bit the instruction names.
++        printCtrBranch(fmt::format("{}.u32 != 0 && !{}", ctr(), crBit(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BSO:
++        printConditionalBranch(false, "so");
++        break;
++
++    case PPC_INST_BNS:
++        printConditionalBranch(true, "so");
++        break;
++
++    // Integer arithmetic
++    case PPC_INST_ADDC:
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        // rD = rA + CA - 1; carry out unless rA == 0 and CA == 0
++        println("\t{}.u8 = ({}.u32 != 0) | {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = {}.u64 + {}.ca - 1;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        // rD = ~rA + CA; carry out only when ~rA == 0xFFFFFFFF and CA == 1
++        println("\t{}.u8 = ({}.u32 == 0) & {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = ~{}.u64 + {}.ca;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = uint64_t((__uint128_t({}.u64) * __uint128_t({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        break;
++
++    case PPC_INST_EQV:
++        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_DCBST:
++        // no op
++        break;
++
++    // Update-form integer loads/stores
++    case PPC_INST_LHZU:  printUpdateD(fmt::format("\t{}.u64 = PPC_LOAD_U16({{}});", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LHAU:  printUpdateD(fmt::format("\t{}.s64 = int16_t(PPC_LOAD_U16({{}}));", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_STHU:  printUpdateD(fmt::format("\tPPC_STORE_U16({{}}, {}.u16);", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LBZUX: printUpdateX(fmt::format("\t{}.u64 = PPC_LOAD_U8({{}});", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LHZUX: printUpdateX(fmt::format("\t{}.u64 = PPC_LOAD_U16({{}});", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LWZUX: printUpdateX(fmt::format("\t{}.u64 = PPC_LOAD_U32({{}});", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LWAUX: printUpdateX(fmt::format("\t{}.s64 = int32_t(PPC_LOAD_U32({{}}));", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_LDUX:  printUpdateX(fmt::format("\t{}.u64 = PPC_LOAD_U64({{}});", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_STBUX: printUpdateX(fmt::format("\tPPC_STORE_U8({{}}, {}.u8);", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_STHUX: printUpdateX(fmt::format("\tPPC_STORE_U16({{}}, {}.u16);", r(insn.operands[0])).c_str()); break;
++    case PPC_INST_STDUX: printUpdateX(fmt::format("\tPPC_STORE_U64({{}}, {}.u64);", r(insn.operands[0])).c_str()); break;
++
++    // Update-form floating point loads/stores
++    case PPC_INST_LFSU:
++        printSetFlushMode(false);
++        printUpdateD(fmt::format("\t{}.u32 = PPC_LOAD_U32({{}});\n\t{}.f64 = double({}.f32);", temp(), f(insn.operands[0]), temp()).c_str());
++        break;
++    case PPC_INST_LFSUX:
++        printSetFlushMode(false);
++        printUpdateX(fmt::format("\t{}.u32 = PPC_LOAD_U32({{}});\n\t{}.f64 = double({}.f32);", temp(), f(insn.operands[0]), temp()).c_str());
++        break;
++    case PPC_INST_LFDU:
++        printSetFlushMode(false);
++        printUpdateD(fmt::format("\t{}.u64 = PPC_LOAD_U64({{}});", f(insn.operands[0])).c_str());
++        break;
++    case PPC_INST_LFDUX:
++        printSetFlushMode(false);
++        printUpdateX(fmt::format("\t{}.u64 = PPC_LOAD_U64({{}});", f(insn.operands[0])).c_str());
++        break;
++    case PPC_INST_STFSU:
++        printSetFlushMode(false);
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        printUpdateD(fmt::format("\tPPC_STORE_U32({{}}, {}.u32);", temp()).c_str());
++        break;
++    case PPC_INST_STFSUX:
++        printSetFlushMode(false);
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        printUpdateX(fmt::format("\tPPC_STORE_U32({{}}, {}.u32);", temp()).c_str());
++        break;
++    case PPC_INST_STFDU:
++        printSetFlushMode(false);
++        printUpdateD(fmt::format("\tPPC_STORE_U64({{}}, {}.u64);", f(insn.operands[0])).c_str());
++        break;
++
++    case PPC_INST_FRSQRTE:
++        printSetFlushMode(false);
++        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
++    // VMX. Registers hold the whole 16-byte vector reversed, so lane-wise ops map lane i to
++    // lane i on both inputs; only cross-lane ops (packs) need their operands swapped.
++    case PPC_INST_LVEHX:
++        // Element load: other elements are undefined, so loading the aligned quadword is valid
++        // (same approach upstream uses for lvewx).
++        print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32) & ~0xF))), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMINSW:  vecBinary("simde_mm_min_epi32"); break;
++    case PPC_INST_VMINUH:  vecBinary("simde_mm_min_epu16"); break;
++    case PPC_INST_VMAXUH:  vecBinary("simde_mm_max_epu16"); break;
++    case PPC_INST_VAVGUH:  vecBinary("simde_mm_avg_epu16"); break;
++    case PPC_INST_VSUBUWM: vecBinary("simde_mm_sub_epi32"); break;
++    case PPC_INST_VSUBUBM: vecBinary("simde_mm_sub_epi8"); break;
++    case PPC_INST_VSUBSHS: vecBinary("simde_mm_subs_epi16"); break;
++
++    case PPC_INST_VCMPGTSB:
++        vecBinary("simde_mm_cmpgt_epi8");
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPGTSW:
++        vecBinary("simde_mm_cmpgt_epi32");
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.s64 = int64_t({}.s32[{}]) + int64_t({}.s32[{}]);", temp(), v(insn.operands[1]), i, v(insn.operands[2]), i);
++            println("\t{}.s32[{}] = {}.s64 > INT_MAX ? INT_MAX : {}.s64 < INT_MIN ? INT_MIN : {}.s64;", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
++    case PPC_INST_VSLH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = {}.u16[{}] << ({}.u16[{}] & 0xF);", vTemp(), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VSRH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = {}.u16[{}] >> ({}.u16[{}] & 0xF);", vTemp(), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VSRAH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.s16[{}] = {}.s16[{}] >> ({}.u16[{}] & 0xF);", vTemp(), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VSPLTISH:
++    {
++        int32_t simm = int32_t(insn.operands[1] & 0x1F);
++        if (simm & 0x10) simm -= 0x20;
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(short({})));", v(insn.operands[0]), simm);
++        break;
++    }
++
++    case PPC_INST_VPKSWSS:
++    case PPC_INST_VPKSWSS128:
++        // Big-endian: vA words fill the high half. With the reversed layout that is packs(vB, vA).
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VSEL128:
++        // vsel128 vD, vA, vB, vD: mask is operand 3 (== vD), same semantics as vsel.
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
++        break;
++    // ---- end Peggle 2 additions ------------------------------------------------------------
++
+     case PPC_INST_ADD:
+         println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+@@ -647,26 +891,14 @@ bool Recompiler::Recompile(
+         csrState = CSRState::Unknown; // the call could change it
+         break;
+ 
+-    case PPC_INST_BDZ:
+-        println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
+-        break;
++    // PPC_INST_BDZ: handled in the Peggle 2 block above (tail-call aware).
+ 
+     case PPC_INST_BDZLR:
+         println("\t--{}.u64;", ctr());
+         println("\tif ({}.u32 == 0) return;", ctr(), insn.operands[0]);
+         break;
+ 
+-    case PPC_INST_BDNZ:
+-        println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
+-        break;
+-
+-    case PPC_INST_BDNZF:
+-        // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
+-        println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
+-        break;
++    // PPC_INST_BDNZ / PPC_INST_BDNZF: handled in the Peggle 2 block above.
+ 
+     case PPC_INST_BEQ:
+         printConditionalBranch(false, "eq");
