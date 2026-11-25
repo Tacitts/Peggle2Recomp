@@ -1,0 +1,153 @@
+﻿diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..a5b6a3e 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -482,8 +482,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                 }
+                 else
+                 {
++                    // Not in the reflection table (Peggle 2 shaders do this): read the raw
++                    // constant register file instead of an undeclared name.
+                     assert(!instr.const0Relative && !instr.const1Relative);
+-                    regFormatted = fmt::format("c{}", reg);
++                    regFormatted = fmt::format("RAW_CONSTANT({})", reg);
+                 }
+             }
+ 
+@@ -599,6 +601,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             case ExportRegister::PSDepth:
+                 exportRegister = "oDepth";
+                 break;
++            default:
++                // Unhandled export target (e.g. memexport): write to a scratch variable
++                // instead of emitting a nameless ".x = ..." that fails to compile.
++                exportRegister = "oUnused";
++                break;
+             }
+         }
+         else
+@@ -625,9 +632,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+             default:
+             {
++                // Interpolators come from the container; anything else (point size / edge
++                // flag export, interpolators missing from the table) goes to a scratch variable.
+                 auto findResult = interpolators.find(instr.vectorDest);
+-                assert(findResult != interpolators.end());
+-                exportRegister = findResult->second;
++                exportRegister = findResult != interpolators.end() ? std::string_view(findResult->second) : std::string_view("oUnused");
+                 break;
+             }
+             }
+@@ -880,6 +888,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
+             break;
+ 
++        case AluScalarOpcode::RetainPrev:
++            // Keep the previous scalar result (was missing: produced "ps = ;").
++            out += "ps";
++            break;
++
+         case AluScalarOpcode::Mins:
+             print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
+             break;
+@@ -1187,8 +1200,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    // Raw register-file access for constants missing from the reflection table (floats,
++    // booleans, loop/integer constants). Vulkan: in the shared constant buffer after offset
++    // 1024: float4[256], then uint[8] boolean bits, then int4[32].
++    out += "#define RAW_CONSTANT(N) vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 1024 + (N) * 16, 0x10)\n";
++    out += "#define RAW_BOOL(N) ((vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 5120 + ((N) / 32) * 4) >> ((N) % 32)) & 1)\n";
++    out += "#define RAW_INT(N) vk::RawBufferLoad<int4>(g_PushConstants.SharedConstants + 5152 + (N) * 16, 0x10)\n";
++
+     out += "\n#else\n\n";
+ 
++    // D3D12: a separate root CBV (b3, space4) with the stage's whole constant register file.
++    out += "cbuffer RawShaderConstants : register(b3, space4)\n";
++    out += "{\n";
++    out += "\tfloat4 g_RawConstants[256];\n";
++    out += "\tuint4 g_RawBooleans[2];\n";
++    out += "\tint4 g_RawIntegers[32];\n";
++    out += "};\n";
++    out += "#define RAW_CONSTANT(N) g_RawConstants[N]\n";
++    out += "#define RAW_BOOL(N) ((g_RawBooleans[(N) / 128][((N) / 32) % 4] >> ((N) % 32)) & 1)\n";
++    out += "#define RAW_INT(N) g_RawIntegers[N]\n\n";
++
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+     out += "{\n";
+ 
+@@ -1418,7 +1449,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\n";
+     }
+ 
+-    bool printedRegisters[32]{};
++    bool printedRegisters[128]{};   // Xenos shaders may use r0-r127 (Peggle 2 uses r111)
+ 
+     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
+ 
+@@ -1457,7 +1488,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\n";
+     }
+ 
+-    for (size_t i = 0; i < 32; i++)
++    for (size_t i = 0; i < 128; i++)
+     {
+         if (!printedRegisters[i])
+         {
+@@ -1483,6 +1514,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
++    out += "\tfloat4 oUnused = 0.0;\n";   // sink for unhandled export targets
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+@@ -1648,7 +1680,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 #ifdef UNLEASHED_RECOMP
+                     print("[unroll] ");
+                 #endif
+-                    println("for (aL = 0; aL < i{}.x; aL++)", uint32_t(cfInstr.loopStart.loopId));
++                    println("for (aL = 0; aL < RAW_INT({}).x; aL++)", uint32_t(cfInstr.loopStart.loopId));
+                     indent();
+                     out += "{\n";
+                     ++indentation;
+@@ -1669,7 +1701,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 else
+                 {
+                     out += "\t\t\t++aL;\n";
+-                    println("\t\t\tif (aL < i{}.x)", uint32_t(cfInstr.loopEnd.loopId));
++                    println("\t\t\tif (aL < RAW_INT({}).x)", uint32_t(cfInstr.loopEnd.loopId));
+                     out += "\t\t\t{\n";
+                     println("\t\t\t\tpc = {};", uint32_t(cfInstr.loopEnd.address));
+                     out += "\t\t\t\tcontinue;\n";
+@@ -1698,7 +1730,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                            println("if (RAW_BOOL({}) {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                     }
+ 
+                     if (simpleControlFlow)
+@@ -1868,7 +1900,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         instrAddress += 12;
+     }
+ 
+-    if (!simpleControlFlow)
++    if (simpleControlFlow)
++    {
++        // Forward jumps to the very end of the program open an "if {" whose closing label is
++        // never reached: close whatever is still open.
++        while (indentation > 1)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++    }
++    else
+     {
+         out += "\t\t\tbreak;\n";
+         out += "\t\t}\n";
