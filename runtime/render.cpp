@@ -185,10 +185,25 @@ namespace
 
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
-        if (msg == WM_CLOSE)
+        switch (msg)
         {
+        case WM_CLOSE:
             Log("[render] window closed: exiting");
             TerminateProcess(GetCurrentProcess(), 0);
+            break;
+        // Keyboard state for input.cpp, from the window's own messages so it follows focus.
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            SetHostKey(int(wp), true);
+            if (msg == WM_SYSKEYDOWN && wp != VK_F4) return 0;   // keep Alt/F10 from opening the system menu
+            break;
+        case WM_KEYUP:
+        case WM_SYSKEYUP:
+            SetHostKey(int(wp), false);
+            break;
+        case WM_KILLFOCUS:
+            ClearHostKeys();
+            break;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }

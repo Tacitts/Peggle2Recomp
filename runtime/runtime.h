@@ -108,6 +108,10 @@ bool SaveShaderContainer(uint32_t addr, const char* source);
 void StartRenderer();
 void RendererPresent(const GuestTextureInfo* preview);
 
+// Host keyboard state (input.cpp), fed by the renderer window's key messages.
+void SetHostKey(int vk, bool down);
+void ClearHostKeys();
+
 // Log the guest call chain of the calling host thread (for hooks).
 void LogGuestBacktrace();
 // Log the guest call chain of another host thread (HANDLE), sampled safely (watchdog).
