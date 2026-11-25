@@ -213,7 +213,11 @@ namespace
             // bit offsets in the input). After the packet holding the loop end, continue at the
             // loop start (packet granularity: the loop end is normally the end of the data).
             uint32_t loops = Bits(d[0], 12, 8), loopStart = Bits(d[3], 0, 26), loopEnd = Bits(d[4], 0, 26);
-            if (loops && loopEnd > loopStart && packet >= loopEnd / kPacketBits)
+            // Disabled: at packet granularity the frames after the loop end are played too, the
+            // sound engine's position tracking drifts and it crashes at the main menu (null
+            // entry at 0x825A5D38). Needs frame-accurate loop ends; until then, play through.
+            constexpr bool kHardwareLoops = false;
+            if (kHardwareLoops && loops && loopEnd > loopStart && packet >= loopEnd / kPacketBits)
             {
                 next = loopStart;
                 if (loops != 255) d[0] = SetBits(d[0], 12, 8, loops - 1);
