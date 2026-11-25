@@ -273,6 +273,8 @@ namespace
     uint32_t g_lastExecuted = 0;
     const bool g_forcePreview = getenv("PEGGLE2_PREVIEW") != nullptr;
 
+    std::atomic<bool> g_screenshotRequested{ false };   // F12 (see SaveScreenshot)
+
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         switch (msg)
@@ -296,6 +298,11 @@ namespace
             if (wp == VK_F11 || (wp == VK_RETURN && (lp & (1 << 29))))
             {
                 if (!(lp & (1 << 30))) ToggleFullscreen(hwnd);   // ignore auto-repeat
+                return 0;
+            }
+            if (wp == VK_F12)   // screenshot (window control, not passed to the game)
+            {
+                if (!(lp & (1 << 30))) g_screenshotRequested = true;
                 return 0;
             }
             SetHostKey(int(wp), true);
@@ -503,6 +510,41 @@ namespace
         }
     }
 
+    // Screenshots: F12 (not passed to the game) or PEGGLE2_SCREENSHOT_FRAME=<n> save the presented
+    // frame to screenshots/peggle2_<time>.png.
+    // Comma-separated frame numbers, each captured once.
+    std::vector<uint64_t> ScreenshotFrames()
+    {
+        std::vector<uint64_t> v;
+        if (const char* e = getenv("PEGGLE2_SCREENSHOT_FRAME"))
+            for (const char* p = e; *p;)
+            {
+                char* end = nullptr;
+                uint64_t n = strtoull(p, &end, 10);
+                if (end == p) break;
+                v.push_back(n);
+                p = *end ? end + 1 : end;
+            }
+        return v;
+    }
+    std::vector<uint64_t> g_screenshotFrames = ScreenshotFrames();
+
+    void SaveScreenshot(ID3D12Resource* readback, UINT pitch)
+    {
+        uint8_t* p = nullptr;
+        if (FAILED(readback->Map(0, nullptr, (void**)&p))) return;
+        std::error_code ec;
+        std::filesystem::create_directories("screenshots", ec);
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char path[96];
+        snprintf(path, sizeof(path), "screenshots/peggle2_%04u%02u%02u-%02u%02u%02u-%03u.png", st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        WritePng(path, (const uint32_t*)p, g_bbW, g_bbH, pitch / 4);
+        readback->Unmap(0, nullptr);
+        Log("[render] screenshot saved to %s", path);
+    }
+
     void PresentFrame(uint64_t frame, const GuestTextureInfo* preview)
     {
         if (g_resizePending) ResizeSwapChain();
@@ -578,6 +620,43 @@ namespace
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         }
+        bool shot = g_screenshotRequested.exchange(false);
+        if (auto it = std::find(g_screenshotFrames.begin(), g_screenshotFrames.end(), frame); it != g_screenshotFrames.end())
+        {
+            g_screenshotFrames.erase(it);
+            shot = true;
+        }
+        ID3D12Resource* readback = nullptr;
+        UINT shotPitch = (g_bbW * 4 + 255) & ~255u;
+        if (shot)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = UINT64(shotPitch) * g_bbH;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))))
+            {
+                D3D12_RESOURCE_STATES before = b.Transition.StateBefore;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                g_list->ResourceBarrier(1, &b);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                src.pResource = g_backBuffers[i];
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.pResource = readback;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint.Footprint = { DXGI_FORMAT_B8G8R8A8_UNORM, g_bbW, g_bbH, 1, shotPitch };
+                g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                (void)before;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            }
+        }
         g_list->ResourceBarrier(1, &b);
         g_list->Close();
         ID3D12CommandList* lists[] = { g_list };
@@ -585,6 +664,13 @@ namespace
         g_swapChain->Present(1, 0);
         g_fenceValues[i] = g_nextFence;
         g_queue->Signal(g_fence, g_nextFence++);
+        if (readback)
+        {
+            g_fence->SetEventOnCompletion(g_fenceValues[i], g_fenceEvent);
+            WaitForSingleObject(g_fenceEvent, INFINITE);
+            SaveScreenshot(readback, shotPitch);
+            readback->Release();
+        }
     }
 
     void RenderThread()

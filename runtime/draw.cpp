@@ -753,6 +753,10 @@ namespace
         c18[1] = (vte & 4) ? vp[2] : 1.0f;   // y scale
         c18[2] = (vte & 2) ? vp[1] : 0.0f;   // x offset
         c18[3] = (vte & 8) ? vp[3] : 0.0f;   // y offset
+        // PA_SU_VTX_CNTL pix_center (bit 0): 0 = Direct3D 9 convention, pixel centres on integer
+        // coordinates (fullscreen quads span -0.5..W-0.5). Host pixel centres are at +0.5, so
+        // shift by half a pixel, or the last row and column are never covered.
+        if (!(d.Reg(0x2302) & 1)) { c18[2] += 0.5f; c18[3] += 0.5f; }
         c19[0] = 2.0f / float(rt.gameW);   // surface pixels -> NDC (viewport = whole surface)
         c19[1] = -2.0f / float(kRtGameHeight);
         c19[2] = -1.0f;
@@ -1132,13 +1136,15 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
         for (size_t k = 0; k < draws.size(); k++)
         {
             const DrawRecord& d = *draws[k];
-            char tex[160] = "";
+            char tex[400] = "";
             size_t at = 0;
-            for (uint32_t s = 0; s < 32 && at < sizeof(tex) - 24; s++)
+            for (uint32_t s = 0; s < 32 && at < sizeof(tex) - 60; s++)
             {
                 const uint32_t* f = d.fetch + s * 6;
                 if ((f[0] & 3) == 3 || !(f[1] >> 12)) continue;
-                at += snprintf(tex + at, sizeof(tex) - at, " t%u=%05X/%ux%u/f%u", s, f[1] >> 12, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, f[1] & 0x3F);
+                at += snprintf(tex + at, sizeof(tex) - at, " t%u=%05X/%ux%u/f%u/p%u/%s/e%u/s%03X", s, f[1] >> 12, (f[2] & 0x1FFF) + 1,
+                               ((f[2] >> 13) & 0x1FFF) + 1, f[1] & 0x3F, ((f[0] >> 22) & 0x1FF) * 32, (f[0] >> 31) ? "T" : "L",
+                               (f[1] >> 6) & 3, (f[3] >> 1) & 0xFFF);
             }
             Log("[dump] %3zu mode %u surf %08X color %08X copy %08X %08X %08X %08X clr %08X %08X %08X %08X win %08X %08X prim %u n %u vs %04llX ps %04llX%s",
                 k, d.Reg(0x2208) & 7, d.Reg(0x2000), d.Reg(0x2001), d.Reg(0x2318), d.Reg(0x2319), d.Reg(0x231A), d.Reg(0x231B),
