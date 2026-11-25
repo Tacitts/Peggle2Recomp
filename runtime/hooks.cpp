@@ -76,3 +76,37 @@ PPC_FUNC(sub_82453B78)
     }
     __imp__sub_82453B78(ctx, base);
 }
+
+// ---- Optional 60 fps: PEGGLE2_60FPS=1 -----------------------------------------------------------
+// The title runs its logic at a fixed 60 updates per second and draws every second update: the
+// frame step (0x8242F8A8, loop mode byte 0x828CE748 = 1) calls the update (0x8242F2C8) and the
+// per-update tick (0x8243CE30, fixed step in f31) twice, then draws, and every flip request is
+// 0x205 (swap interval 2: bits 8-11; tear threshold 5% in the low byte), so 30 fps on a 60 Hz
+// display. With PEGGLE2_60FPS set, the second update pair is skipped and the flip handler
+// (0x8261F0B8, called from the GPU interrupt) sees interval 1: one update per drawn frame, the
+// same 60 updates per second, drawn at 60 fps. If a frame takes longer than a vblank the game
+// slows down (as a 60 fps console game would) instead of skipping.
+static bool Sixty()
+{
+    static const bool on = getenv("PEGGLE2_60FPS") && atoi(getenv("PEGGLE2_60FPS")) != 0;
+    return on;
+}
+PPC_FUNC_IMPL(__imp__sub_8261F0B8);
+PPC_FUNC(sub_8261F0B8)
+{
+    if (Sixty() && ((ctx.r3.u32 >> 8) & 0xF) > 1)
+        ctx.r3.u64 = (ctx.r3.u32 & ~0xF00u) | 0x100u;
+    __imp__sub_8261F0B8(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_8242F2C8);
+PPC_FUNC(sub_8242F2C8)
+{
+    if (Sixty() && uint32_t(ctx.lr) == 0x8242FA0C) return;   // second update of the frame step
+    __imp__sub_8242F2C8(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_8243CE30);
+PPC_FUNC(sub_8243CE30)
+{
+    if (Sixty() && uint32_t(ctx.lr) == 0x8242FA34) return;   // its per-update tick
+    __imp__sub_8243CE30(ctx, base);
+}
