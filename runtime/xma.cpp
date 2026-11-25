@@ -53,7 +53,7 @@ namespace
         std::vector<uint8_t> packetData;
         uint64_t packets = 0;
         float peak = 0;                              // decoded peak since the last log (debugging)
-        uint32_t switches = 0, seeks = 0, reopens = 0, restarts = 0;
+        uint32_t switches = 0, seeks = 0, reopens = 0, restarts = 0, loopsTaken = 0;
         uint32_t lastWrite = 0xFFFFFFFF;             // output write offset we last left
         bool ended = false;                          // input ran out (next valid input = new sound)
         uint32_t lastLoop[3] = {};                   // loop count, start, end seen (debugging)
@@ -209,6 +209,17 @@ namespace
             }
             DecodePacket(h, GuestPtr(0xA0000000u | ((current ? d[6] : d[5]) + packet * kPacketBytes)));
             uint32_t next = (packet + 1) * kPacketBits + 32;   // past the next packet's header
+            // Hardware loop: loop count (d0 bits 12-19, 255 = forever), loop start/end (d3/d4,
+            // bit offsets in the input). After the packet holding the loop end, continue at the
+            // loop start (packet granularity: the loop end is normally the end of the data).
+            uint32_t loops = Bits(d[0], 12, 8), loopStart = Bits(d[3], 0, 26), loopEnd = Bits(d[4], 0, 26);
+            if (loops && loopEnd > loopStart && packet >= loopEnd / kPacketBits)
+            {
+                next = loopStart;
+                if (loops != 255) d[0] = SetBits(d[0], 12, 8, loops - 1);
+                avcodec_flush_buffers(h.codec);   // bitstream discontinuity; queued output is kept
+                h.loopsTaken++;
+            }
             d[2] = SetBits(d[2], 0, 26, next);
             h.expectedReadOffset = next;
             changed = true;
@@ -225,6 +236,7 @@ namespace
         // Clear a finished buffer's valid bit unless the title has already refilled it.
         if (Bits(o[0], 20, 1) && !Bits(d[0], 20, 1) && c5 == o[5]) c0 = SetBits(c0, 20, 1, 0);
         if (Bits(o[0], 21, 1) && !Bits(d[0], 21, 1) && c6 == o[6]) c0 = SetBits(c0, 21, 1, 0);
+        if (Bits(c0, 12, 8) == Bits(o[0], 12, 8)) c0 = SetBits(c0, 12, 8, Bits(d[0], 12, 8));   // loop count
         if (Bits(c2, 0, 26) == Bits(o[2], 0, 26)) c2 = SetBits(c2, 0, 26, Bits(d[2], 0, 26));
         else h.expectedReadOffset = 0xFFFFFFFF;   // the title moved it meanwhile: follow it next tick
         if (Bits(c4, 31, 1) == Bits(o[4], 31, 1)) c4 = SetBits(c4, 31, 1, Bits(d[4], 31, 1));
@@ -252,8 +264,8 @@ void XmaTick(const std::vector<uint32_t>& contexts)
         nextLog += std::chrono::seconds(10);
         for (auto& [c, h] : g_host)
             if (h->packets)
-                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, loop count %u start %u end %u",
-                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens,
+                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, loop count %u start %u end %u",
+                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken,
                     h->lastLoop[0], h->lastLoop[1], h->lastLoop[2]), h->peak = 0;
     }
     // Forget decoders of released contexts.
