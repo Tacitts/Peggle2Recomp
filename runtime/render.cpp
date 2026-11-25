@@ -72,7 +72,7 @@ namespace
     // Decode mip 0 of a texture into BGRA8 (w x h). Returns false for unsupported formats.
     bool DecodeTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out)
     {
-        enum { k_8 = 2, k_5_6_5 = 4, k_8_8_8_8 = 6, k_8_8 = 10, k_DXT1 = 18, k_DXT2_3 = 19, k_DXT4_5 = 20,
+        enum { k_8 = 2, k_5_6_5 = 4, k_8_8_8_8 = 6, k_8_8 = 10, k_DXT1 = 18, k_DXT2_3 = 19, k_DXT4_5 = 20, k_16_16_16_16 = 26,
                k_DXT1_AS_16 = 52, k_DXT2_3_AS_16 = 53, k_DXT4_5_AS_16 = 54 };
         uint32_t fmt = t.format, bpb, blockDim;
         switch (fmt)
@@ -80,6 +80,7 @@ namespace
         case k_8: bpb = 1; blockDim = 1; break;
         case k_5_6_5: case k_8_8: bpb = 2; blockDim = 1; break;
         case k_8_8_8_8: bpb = 4; blockDim = 1; break;
+        case k_16_16_16_16: bpb = 8; blockDim = 1; break;
         case k_DXT1: case k_DXT1_AS_16: bpb = 8; blockDim = 4; break;
         case k_DXT2_3: case k_DXT4_5: case k_DXT2_3_AS_16: case k_DXT4_5_AS_16: bpb = 16; blockDim = 4; break;
         default: return false;
@@ -105,6 +106,8 @@ namespace
                     if (fmt == k_8) o = 0xFF000000u | (block[0] * 0x010101u);
                     else if (fmt == k_8_8) o = (uint32_t(block[1]) << 24) | (block[0] * 0x010101u);
                     else if (fmt == k_5_6_5) o = Rgb565ToBgra(uint16_t(block[0] | (block[1] << 8)));
+                    else if (fmt == k_16_16_16_16)   // unorm 16-bit x, y, z, w -> top bytes, in 8888's byte order
+                        o = block[1] | (block[3] << 8) | (block[5] << 16) | (uint32_t(block[7]) << 24);
                     else o = block[0] | (block[1] << 8) | (block[2] << 16) | (uint32_t(block[3]) << 24);
                     continue;
                 }

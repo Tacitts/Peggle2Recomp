@@ -292,7 +292,7 @@ namespace
             uint8_t b = uint8_t(p), g = uint8_t(p >> 8), r = uint8_t(p >> 16), a = uint8_t(p >> 24);
             uint8_t n[4];
             if (dxt || format == 4) { n[0] = r; n[1] = g; n[2] = b; n[3] = a; }       // DXT, 5_6_5
-            else if (format == 6) { n[0] = b; n[1] = g; n[2] = r; n[3] = a; }         // 8_8_8_8: x = first byte
+            else if (format == 6 || format == 26) { n[0] = b; n[1] = g; n[2] = r; n[3] = a; }   // 8_8_8_8 / 16_16_16_16: x = first component
             else if (format == 2) { n[0] = r; n[1] = 0; n[2] = 0; n[3] = 255; }       // 8
             else if (format == 10) { n[0] = r; n[1] = a; n[2] = 0; n[3] = 255; }      // 8_8
             else { n[0] = r; n[1] = g; n[2] = b; n[3] = a; }
