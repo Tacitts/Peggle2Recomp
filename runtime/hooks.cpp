@@ -76,27 +76,3 @@ PPC_FUNC(sub_82453B78)
     }
     __imp__sub_82453B78(ctx, base);
 }
-
-// ---- Sound engine: random-container index past the end of its list ------------------------------
-// Crash at the main menu (about 1 run in 4 when the intro is skipped): the sound engine's
-// random container (Wwise, worker thread) picks an item by walking its list until it has passed
-// N eligible items, N = rand() % (its running count of eligible items, +12 of the container).
-// When that running count disagrees with the per-item flags, the walk runs past the list:
-// 0x825A5C68 is then called with index 6 for a 4-entry array (descriptor in r6: {array, count})
-// and reads a null entry at 0x825A5D38. Root cause not found yet (lost update between threads?).
-// Mitigation: wrap such an index back into the list, so a valid variation plays instead.
-PPC_FUNC_IMPL(__imp__sub_825A5C68);
-PPC_FUNC(sub_825A5C68)
-{
-    uint32_t desc = ctx.r6.u32, idx = ctx.r5.u32 & 0xFFFF;
-    uint32_t count = desc ? Load32(desc + 4) : 0;
-    if (count && count < 0x10000 && idx >= count)
-    {
-        static std::atomic<int> logged{ 0 };
-        if (logged++ < 10)
-            Log("[sound] random container index %u past its %u-entry list (container %08X): wrapped to %u",
-                idx, count, ctx.r7.u32, idx % count);
-        ctx.r5.u64 = (ctx.r5.u64 & ~0xFFFFull) | (idx % count);
-    }
-    __imp__sub_825A5C68(ctx, base);
-}
