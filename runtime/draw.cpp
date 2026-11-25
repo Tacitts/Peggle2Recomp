@@ -31,6 +31,7 @@ namespace
     constexpr uint64_t kUploadPerFrame = 64ull << 20;
     constexpr uint32_t kRawCbSize = 4096 + 32 + 512;     // float4[256], uint4[2], int4[32]
     constexpr uint32_t kSharedCbSize = 20 * 16;
+    constexpr float kGameWidth = 1280.0f, kGameHeight = 720.0f;   // the game's frame size
 
     ID3D12Device* g_dev = nullptr;
     ID3D12RootSignature* g_rootSig = nullptr;
@@ -515,7 +516,7 @@ namespace
     float AsFloat(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 
     // Execute one draw. Returns false if it was skipped.
-    bool ExecuteDraw(ID3D12GraphicsCommandList* list, FrameResources& fr, const DrawRecord& d, uint32_t rtW, uint32_t rtH)
+    bool ExecuteDraw(ID3D12GraphicsCommandList* list, FrameResources& fr, const DrawRecord& d, uint32_t rtW, uint32_t rtH, const float area[4])
     {
         if (!d.vsCode || !d.psCode || !d.numIndices) return false;
         uint32_t colorControl = d.Reg(xreg::RB_COLORCONTROL);
@@ -679,8 +680,8 @@ namespace
         c18[1] = (vte & 4) ? vp[2] : 1.0f;   // y scale
         c18[2] = (vte & 2) ? vp[1] : 0.0f;   // x offset
         c18[3] = (vte & 8) ? vp[3] : 0.0f;   // y offset
-        c19[0] = 2.0f / float(rtW);
-        c19[1] = -2.0f / float(rtH);
+        c19[0] = 2.0f / kGameWidth;   // game pixels -> NDC of the game viewport
+        c19[1] = -2.0f / kGameHeight;
         c19[2] = -1.0f;
         c19[3] = 1.0f;
 
@@ -708,7 +709,13 @@ namespace
         // Scissor: PA_SC_WINDOW_SCISSOR_TL/BR (x bits 0-14, y bits 16-30).
         uint32_t tl = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_TL), br = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_BR);
         D3D12_RECT sc{ LONG(tl & 0x7FFF), LONG((tl >> 16) & 0x7FFF), LONG(br & 0x7FFF), LONG((br >> 16) & 0x7FFF) };
-        if (sc.right <= sc.left || sc.bottom <= sc.top) sc = { 0, 0, LONG(rtW), LONG(rtH) };
+        if (sc.right <= sc.left || sc.bottom <= sc.top) sc = { 0, 0, LONG(kGameWidth), LONG(kGameHeight) };
+        // Game pixels -> render-target pixels of the letterboxed game area.
+        float sx = area[2] / kGameWidth, sy = area[3] / kGameHeight;
+        sc = { LONG(std::floor(area[0] + sc.left * sx)), LONG(std::floor(area[1] + sc.top * sy)),
+               LONG(std::ceil(area[0] + sc.right * sx)), LONG(std::ceil(area[1] + sc.bottom * sy)) };
+        sc.left = std::max<LONG>(sc.left, 0);
+        sc.top = std::max<LONG>(sc.top, 0);
         sc.right = std::min<LONG>(sc.right, rtW);
         sc.bottom = std::min<LONG>(sc.bottom, rtH);
 
@@ -789,7 +796,7 @@ bool DrawInit(ID3D12Device* device, uint32_t framesInFlight)
     return true;
 }
 
-uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtW, uint32_t rtH, const DrawList& draws, uint32_t frameSlot)
+uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtW, uint32_t rtH, const float area[4], const DrawList& draws, uint32_t frameSlot)
 {
     if (!g_rootSig || frameSlot >= g_frameRes.size()) return 0;
     FrameResources& fr = g_frameRes[frameSlot];
@@ -811,12 +818,12 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
     list->SetGraphicsRootSignature(g_rootSig);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvHandle };
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    D3D12_VIEWPORT vp{ 0, 0, float(rtW), float(rtH), 0, 1 };
+    D3D12_VIEWPORT vp{ area[0], area[1], area[2], area[3], 0, 1 };
     list->RSSetViewports(1, &vp);
 
     uint32_t executed = 0;
     for (const auto& d : draws)
-        if (ExecuteDraw(list, fr, *d, rtW, rtH)) executed++;
+        if (ExecuteDraw(list, fr, *d, rtW, rtH, area)) executed++;
 
     // Drop textures unused for ~10 s (the resource goes away when this slot comes back).
     if ((g_frameCounter % 600) == 0)

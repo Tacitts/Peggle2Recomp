@@ -187,6 +187,39 @@ namespace
     std::vector<uint32_t> g_decoded;
     char g_previewDesc[96] = "none";
 
+    // Window / swap chain size. The game always renders a 1280x720 frame; draws are rasterized
+    // at the back buffer's real resolution into a letterboxed viewport (aspect preserved).
+    UINT g_bbW = kWidth, g_bbH = kHeight;
+    std::atomic<bool> g_resizePending{ false };
+    std::atomic<UINT> g_pendingW{ kWidth }, g_pendingH{ kHeight };
+    bool g_fullscreen = false;
+    RECT g_windowedRect{};
+    LONG_PTR g_windowedStyle = 0;
+
+    // Borderless fullscreen on the window's monitor (F11 or Alt+Enter); the game is unaware.
+    void ToggleFullscreen(HWND hwnd)
+    {
+        if (!g_fullscreen)
+        {
+            GetWindowRect(hwnd, &g_windowedRect);
+            g_windowedStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            MONITORINFO mi{ sizeof(mi) };
+            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (g_windowedStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        }
+        else
+        {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, g_windowedStyle);
+            SetWindowPos(hwnd, nullptr, g_windowedRect.left, g_windowedRect.top, g_windowedRect.right - g_windowedRect.left,
+                         g_windowedRect.bottom - g_windowedRect.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        }
+        g_fullscreen = !g_fullscreen;
+        ShowCursor(g_fullscreen ? FALSE : TRUE);
+        Log("[render] %s", g_fullscreen ? "fullscreen" : "windowed");
+    }
+
     // Translated draws: the latest complete frame from the GPU thread (RendererSubmitDraws).
     bool g_drawReady = false;
     std::mutex g_drawsLock;
@@ -202,9 +235,23 @@ namespace
             Log("[render] window closed: exiting");
             TerminateProcess(GetCurrentProcess(), 0);
             break;
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
+            {
+                g_pendingW = LOWORD(lp);
+                g_pendingH = HIWORD(lp);
+                g_resizePending = true;
+            }
+            break;
         // Keyboard state for input.cpp, from the window's own messages so it follows focus.
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
+            // Window controls (not passed to the game): F11 or Alt+Enter toggles fullscreen.
+            if (wp == VK_F11 || (wp == VK_RETURN && (lp & (1 << 29))))
+            {
+                if (!(lp & (1 << 30))) ToggleFullscreen(hwnd);   // ignore auto-repeat
+                return 0;
+            }
             SetHostKey(int(wp), true);
             if (msg == WM_SYSKEYDOWN && wp != VK_F4) return 0;   // keep Alt/F10 from opening the system menu
             break;
@@ -381,8 +428,38 @@ namespace
         snprintf(g_previewDesc, sizeof(g_previewDesc), "%ux%u fmt %u%s", tex->width, tex->height, tex->format, tex->tiled ? " tiled" : "");
     }
 
+    void WaitIdle()
+    {
+        g_queue->Signal(g_fence, g_nextFence);
+        g_fence->SetEventOnCompletion(g_nextFence++, g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, INFINITE);
+    }
+
+    void ResizeSwapChain()
+    {
+        UINT w = g_pendingW, h = g_pendingH;
+        g_resizePending = false;
+        if (w == g_bbW && h == g_bbH) return;
+        WaitIdle();
+        for (auto& bb : g_backBuffers) { bb->Release(); bb = nullptr; }
+        if (FAILED(g_swapChain->ResizeBuffers(kBuffers, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 0)))
+        {
+            Log("[render] ResizeBuffers(%u x %u) failed", w, h);
+            g_swapChain->ResizeBuffers(kBuffers, g_bbW, g_bbH, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+        }
+        else { g_bbW = w; g_bbH = h; }
+        for (UINT i = 0; i < kBuffers; i++)
+        {
+            g_swapChain->GetBuffer(i, IID_PPV_ARGS(&g_backBuffers[i]));
+            D3D12_CPU_DESCRIPTOR_HANDLE rh = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rh.ptr += SIZE_T(i) * g_rtvSize;
+            g_device->CreateRenderTargetView(g_backBuffers[i], nullptr, rh);
+        }
+    }
+
     void PresentFrame(uint64_t frame, const GuestTextureInfo* preview)
     {
+        if (g_resizePending) ResizeSwapChain();
         UINT i = g_swapChain->GetCurrentBackBufferIndex();
         if (g_fence->GetCompletedValue() < g_fenceValues[i])
         {
@@ -423,12 +500,16 @@ namespace
         g_list->ClearRenderTargetView(rtv, draws.empty() ? color : black, 0, nullptr);
         if (!draws.empty())
         {
-            g_lastExecuted = DrawFrame(g_list, rtv.ptr, kWidth, kHeight, draws, i);
+            // Letterboxed game area in back-buffer pixels.
+            float scale = std::min(float(g_bbW) / kWidth, float(g_bbH) / kHeight);
+            float area[4] = { (g_bbW - kWidth * scale) * 0.5f, (g_bbH - kHeight * scale) * 0.5f, kWidth * scale, kHeight * scale };
+            g_lastExecuted = DrawFrame(g_list, rtv.ptr, g_bbW, g_bbH, area, draws, i);
             snprintf(g_previewDesc, sizeof(g_previewDesc), "%u/%zu draws", g_lastExecuted, draws.size());
             if (frame == 600 || frame == 1200 || frame == 2400 || frame == 3600)
                 Log("[render] frame %llu: %u of %zu draws executed", (unsigned long long)frame, g_lastExecuted, draws.size());
         }
 
+        if (pw > g_bbW || ph > g_bbH) pw = ph = 0;   // preview doesn't fit a small window
         if (pw && ph)
         {
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -440,7 +521,7 @@ namespace
             src.pResource = g_upload[i];
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             src.PlacedFootprint.Footprint = { DXGI_FORMAT_B8G8R8A8_UNORM, pw, ph, 1, kUploadPitch };
-            g_list->CopyTextureRegion(&dst, (kWidth - pw) / 2, (kHeight - ph) / 2, 0, &src, nullptr);
+            g_list->CopyTextureRegion(&dst, (g_bbW - pw) / 2, (g_bbH - ph) / 2, 0, &src, nullptr);
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         }

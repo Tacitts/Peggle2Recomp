@@ -96,8 +96,9 @@ bool DrawInit(ID3D12Device* device, uint32_t framesInFlight);
 // Record `draws` into `list` (render target already bound state: RENDER_TARGET), using the
 // per-frame resources of `frameSlot` (the caller has waited for that slot's previous frame).
 // Returns the number of draws executed.
+// `gameArea` = {x, y, width, height}: where the game's 1280x720 frame goes in the render target.
 uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtWidth, uint32_t rtHeight,
-                   const DrawList& draws, uint32_t frameSlot);
+                   const float gameArea[4], const DrawList& draws, uint32_t frameSlot);
 
 // Texture decoding shared with the preview (render.cpp): mip 0 to BGRA8.
 struct GuestTextureInfo;
