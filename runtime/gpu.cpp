@@ -591,9 +591,10 @@ namespace
         }
         case PM4_NOP:
             // VdSwap's NOP carries a marker: the frame's draws are complete.
-            if (count >= 1 && r.Read() == kSwapMarker)
+            if (count >= 2 && r.Read() == kSwapMarker)
             {
-                RendererSubmitDraws(std::move(g_frameDrawList));
+                uint32_t frontBuffer = r.Read();   // physical address VdSwap displays
+                RendererSubmitDraws(std::move(g_frameDrawList), frontBuffer);
                 g_frameDrawList = {};
             }
             break;
@@ -844,8 +845,16 @@ IMPORT(VdSwap)
         Store32(buf, (3u << 30) | ((63u - 1) << 16) | (PM4_NOP << 8));
         for (uint32_t i = 1; i < 64; i++) Store32(buf + i * 4, 0);
         Store32(buf + 4, kSwapMarker);   // the GPU thread ends the frame's draw list here
+        // ...and learns which texture is displayed: base address from the front buffer's fetch
+        // constant (r4, dword1 bits 12-31).
+        uint32_t front = ctx.r4.u32 ? (Load32(ctx.r4.u32 + 4) & 0x1FFFF000u) : 0;
+        Store32(buf + 8, front);
     }
     uint32_t n = ++g_swaps;
+    // r4: the front buffer's texture fetch constant (6 dwords) - what the swap displays.
+    if (uint32_t fetch = ctx.r4.u32; fetch && (n <= 3 || (n % 600) == 0))
+        Log("[gpu] VdSwap #%u front buffer fetch: %08X %08X %08X %08X %08X %08X", n, Load32(fetch), Load32(fetch + 4),
+            Load32(fetch + 8), Load32(fetch + 12), Load32(fetch + 16), Load32(fetch + 20));
     // Hand the frame's main texture to the renderer, then start a new frame.
     GuestTextureInfo best;
     uint32_t frameDraws;

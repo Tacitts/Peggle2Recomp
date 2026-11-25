@@ -224,6 +224,7 @@ namespace
     bool g_drawReady = false;
     std::mutex g_drawsLock;
     DrawList g_latestDraws;
+    uint32_t g_latestFront = 0;
     uint32_t g_lastExecuted = 0;
     const bool g_forcePreview = getenv("PEGGLE2_PREVIEW") != nullptr;
 
@@ -467,10 +468,12 @@ namespace
             WaitForSingleObject(g_fenceEvent, INFINITE);
         }
         DrawList draws;
+        uint32_t front = 0;
         if (g_drawReady && !g_forcePreview)
         {
             std::lock_guard<std::mutex> g(g_drawsLock);
             draws = g_latestDraws;
+            front = g_latestFront;
         }
         UINT pw = 0, ph = 0;
         if (draws.empty()) PreparePreview(i, preview, pw, ph);
@@ -503,7 +506,7 @@ namespace
             // Letterboxed game area in back-buffer pixels.
             float scale = std::min(float(g_bbW) / kWidth, float(g_bbH) / kHeight);
             float area[4] = { (g_bbW - kWidth * scale) * 0.5f, (g_bbH - kHeight * scale) * 0.5f, kWidth * scale, kHeight * scale };
-            g_lastExecuted = DrawFrame(g_list, rtv.ptr, g_bbW, g_bbH, area, draws, i);
+            g_lastExecuted = DrawFrame(g_list, rtv.ptr, g_bbW, g_bbH, area, draws, front, i);
             snprintf(g_previewDesc, sizeof(g_previewDesc), "%u/%zu draws", g_lastExecuted, draws.size());
             if (frame == 600 || frame == 1200 || frame == 2400 || frame == 3600)
                 Log("[render] frame %llu: %u of %zu draws executed", (unsigned long long)frame, g_lastExecuted, draws.size());
@@ -580,10 +583,11 @@ namespace
     }
 }
 
-void RendererSubmitDraws(DrawList&& draws)
+void RendererSubmitDraws(DrawList&& draws, uint32_t frontBuffer)
 {
     std::lock_guard<std::mutex> g(g_drawsLock);
     g_latestDraws = std::move(draws);
+    g_latestFront = frontBuffer;
 }
 
 void StartRenderer()

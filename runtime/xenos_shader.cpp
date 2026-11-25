@@ -187,12 +187,12 @@ namespace
         return compiler;
     }
 
-    bool CompileDxil(const std::string& hlsl, bool pixel, std::vector<uint8_t>& out, std::string& errors)
+    bool CompileDxil(const std::string& hlsl, const wchar_t* target, std::vector<uint8_t>& out, std::string& errors)
     {
         IDxcCompiler3* dxc = Dxc();
         if (!dxc) { errors = "no DXC"; return false; }
         DxcBuffer src{ hlsl.data(), hlsl.size(), DXC_CP_UTF8 };
-        const wchar_t* args[] = { L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2021", L"-all-resources-bound",
+        const wchar_t* args[] = { L"-T", target, L"-HV", L"2021", L"-all-resources-bound",
                                   L"-Wno-ignored-attributes", L"-Qstrip_debug", L"-O3" };
         IDxcResult* result = nullptr;
         if (FAILED(dxc->Compile(&src, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || !result)
@@ -280,7 +280,7 @@ std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixe
         ShaderRecompiler recompiler;
         recompiler.recompile(container.data(), include);
         hlsl = AdjustHlsl(std::move(recompiler.out), pixel);
-        ok = CompileDxil(hlsl, pixel, t->dxil, errors);
+        ok = CompileDxil(hlsl, pixel ? L"ps_6_0" : L"vs_6_0", t->dxil, errors);
     }
     else errors = "more than 16 vertex fetches";
 
@@ -301,4 +301,9 @@ std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixe
         (unsigned long long)hash, t->dxil.size(), t->info.vertexElements.size(), t->info.textureSlotMask);
     g_cache[hash] = t;
     return t;
+}
+
+bool CompileHlsl(const std::string& hlsl, const wchar_t* target, std::vector<uint8_t>& dxil, std::string& errors)
+{
+    return CompileDxil(hlsl, target, dxil, errors);
 }

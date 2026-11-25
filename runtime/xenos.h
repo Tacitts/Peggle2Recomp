@@ -62,6 +62,8 @@ struct TranslatedShader
     std::vector<uint8_t> dxil;
 };
 std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixel, const std::vector<uint32_t>& beWords);
+// Plain HLSL -> DXIL with the same compiler (runtime-owned shaders, e.g. the present blit).
+bool CompileHlsl(const std::string& hlsl, const wchar_t* target, std::vector<uint8_t>& dxil, std::string& errors);
 
 // A vertex buffer copied out of guest memory at draw time, byte-swapped to little-endian.
 struct VertexStream
@@ -87,7 +89,8 @@ struct DrawRecord
 using DrawList = std::vector<std::shared_ptr<const DrawRecord>>;
 
 // GPU thread -> renderer: the draws of one finished frame (at VdSwap's marker).
-void RendererSubmitDraws(DrawList&& draws);
+// frontBuffer: physical address of the texture VdSwap displays (0 if unknown).
+void RendererSubmitDraws(DrawList&& draws, uint32_t frontBuffer);
 
 // Host draw execution (draw.cpp), called from the render thread (render.cpp).
 struct ID3D12Device;
@@ -96,9 +99,11 @@ bool DrawInit(ID3D12Device* device, uint32_t framesInFlight);
 // Record `draws` into `list` (render target already bound state: RENDER_TARGET), using the
 // per-frame resources of `frameSlot` (the caller has waited for that slot's previous frame).
 // Returns the number of draws executed.
-// `gameArea` = {x, y, width, height}: where the game's 1280x720 frame goes in the render target.
+// Draws go to host render targets (EDRAM model); resolves copy into host textures. The texture
+// resolved to `frontBuffer` (else the widest render target) is then scaled into `rtvHandle`
+// (the back buffer, state RENDER_TARGET) at `gameArea` = {x, y, width, height}.
 uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtWidth, uint32_t rtHeight,
-                   const float gameArea[4], const DrawList& draws, uint32_t frameSlot);
+                   const float gameArea[4], const DrawList& draws, uint32_t frontBuffer, uint32_t frameSlot);
 
 // Texture decoding shared with the preview (render.cpp): mip 0 to BGRA8.
 struct GuestTextureInfo;

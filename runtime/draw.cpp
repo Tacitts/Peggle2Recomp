@@ -73,6 +73,39 @@ namespace
     std::unordered_map<std::string, ID3D12PipelineState*> g_psos;
     std::unordered_map<uint64_t, bool> g_loggedSkip;
 
+    // ---- EDRAM model ---------------------------------------------------------------------------
+    // Xenos draws into on-chip EDRAM and "resolves" (copies) it to textures in memory. Here each
+    // EDRAM surface (colour base + pitch) is a host render target, rendered at g_scale host
+    // pixels per game pixel (native resolution), and each resolve copies into a host texture
+    // keyed by its destination address; texture fetches of that address sample it directly.
+    constexpr DXGI_FORMAT kRtFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr uint32_t kRtGameHeight = 1024;    // rows kept per surface, in game pixels
+    float g_scale = 1.0f;
+    ID3D12DescriptorHeap* g_targetRtvHeap = nullptr;
+    uint32_t g_targetRtvSize = 0;
+    constexpr uint32_t kTargetRtvCount = 64;
+    std::vector<uint32_t> g_targetRtvFree;
+
+    struct HostTarget
+    {
+        ID3D12Resource* res = nullptr;
+        uint32_t gameW = 0, hostW = 0, hostH = 0, rtv = 0;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    };
+    std::unordered_map<uint64_t, HostTarget> g_targets;     // (colour base << 32) | pitch
+
+    struct ResolvedTexture
+    {
+        ID3D12Resource* res = nullptr;
+        uint32_t gameW = 0, gameH = 0, hostW = 0, hostH = 0;
+        bool swapRB = false;                                // RB_COPY_DEST_INFO dest_swap
+        std::unordered_map<uint32_t, uint32_t> srvBySwizzle;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    };
+    std::unordered_map<uint32_t, ResolvedTexture> g_resolved;   // physical address -> texture
+
+    ID3D12PipelineState* g_blitPso = nullptr;
+
     template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
     ID3D12Resource* CreateBuffer(uint64_t size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
@@ -273,12 +306,46 @@ namespace
         }
     }
 
+    uint32_t AllocCpuSrv()
+    {
+        if (!g_cpuSrvFree.empty()) { uint32_t i = g_cpuSrvFree.back(); g_cpuSrvFree.pop_back(); return i; }
+        return g_cpuSrvNext < kCpuSrvCount ? g_cpuSrvNext++ : 0;
+    }
+
+    // SRV of a resolved texture as the fetch constant sees it: the resolve's red/blue swap,
+    // then the fetch swizzle, both as a component mapping.
+    uint32_t ResolvedSrv(ResolvedTexture& r, uint32_t swizzle)
+    {
+        auto it = r.srvBySwizzle.find(swizzle);
+        if (it != r.srvBySwizzle.end()) return it->second;
+        uint32_t idx = AllocCpuSrv();
+        if (!idx) return 0;
+        UINT map[4];
+        for (int c = 0; c < 4; c++)
+        {
+            uint32_t sw = (swizzle >> (3 * c)) & 7;
+            if (sw == 4) map[c] = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
+            else if (sw == 5 || sw > 5) map[c] = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1;
+            else map[c] = (r.swapRB && sw < 3) ? 2 - sw : sw;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = kRtFormat;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(map[0], map[1], map[2], map[3]);
+        sd.Texture2D.MipLevels = 1;
+        g_dev->CreateShaderResourceView(r.res, &sd, CpuSrv(idx));
+        r.srvBySwizzle[swizzle] = idx;
+        return idx;
+    }
+
     // CPU SRV index for the texture in fetch slot `f` (0 = dummy).
     uint32_t TextureFor(ID3D12GraphicsCommandList* list, FrameResources& fr, const uint32_t* f)
     {
         GuestTextureInfo t{};
         if (!DescribeTexture(f, t)) return 0;
         uint32_t swizzle = (f[3] >> 1) & 0xFFF;
+        auto rit = g_resolved.find(t.address & 0x1FFFFFFFu);
+        if (rit != g_resolved.end()) return ResolvedSrv(rit->second, swizzle);
         char key[96];
         snprintf(key, sizeof(key), "%08X %ux%u p%u f%u e%u t%u s%03X", t.address, t.width, t.height, t.pitch, t.format, t.endian, t.tiled, swizzle);
         uint64_t content = SampleHash(t);
@@ -493,7 +560,7 @@ namespace
         pd.InputLayout = { layout.data(), UINT(layout.size()) };
         pd.PrimitiveTopologyType = topo;
         pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        pd.RTVFormats[0] = kRtFormat;
         pd.SampleDesc.Count = 1;
         ID3D12PipelineState* pso = nullptr;
         HRESULT hr = g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
@@ -516,7 +583,7 @@ namespace
     float AsFloat(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 
     // Execute one draw. Returns false if it was skipped.
-    bool ExecuteDraw(ID3D12GraphicsCommandList* list, FrameResources& fr, const DrawRecord& d, uint32_t rtW, uint32_t rtH, const float area[4])
+    bool ExecuteDraw(ID3D12GraphicsCommandList* list, FrameResources& fr, const DrawRecord& d, const HostTarget& rt)
     {
         if (!d.vsCode || !d.psCode || !d.numIndices) return false;
         uint32_t colorControl = d.Reg(xreg::RB_COLORCONTROL);
@@ -680,8 +747,8 @@ namespace
         c18[1] = (vte & 4) ? vp[2] : 1.0f;   // y scale
         c18[2] = (vte & 2) ? vp[1] : 0.0f;   // x offset
         c18[3] = (vte & 8) ? vp[3] : 0.0f;   // y offset
-        c19[0] = 2.0f / kGameWidth;   // game pixels -> NDC of the game viewport
-        c19[1] = -2.0f / kGameHeight;
+        c19[0] = 2.0f / float(rt.gameW);   // surface pixels -> NDC (viewport = whole surface)
+        c19[1] = -2.0f / float(kRtGameHeight);
         c19[2] = -1.0f;
         c19[3] = 1.0f;
 
@@ -709,15 +776,12 @@ namespace
         // Scissor: PA_SC_WINDOW_SCISSOR_TL/BR (x bits 0-14, y bits 16-30).
         uint32_t tl = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_TL), br = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_BR);
         D3D12_RECT sc{ LONG(tl & 0x7FFF), LONG((tl >> 16) & 0x7FFF), LONG(br & 0x7FFF), LONG((br >> 16) & 0x7FFF) };
-        if (sc.right <= sc.left || sc.bottom <= sc.top) sc = { 0, 0, LONG(kGameWidth), LONG(kGameHeight) };
-        // Game pixels -> render-target pixels of the letterboxed game area.
-        float sx = area[2] / kGameWidth, sy = area[3] / kGameHeight;
-        sc = { LONG(std::floor(area[0] + sc.left * sx)), LONG(std::floor(area[1] + sc.top * sy)),
-               LONG(std::ceil(area[0] + sc.right * sx)), LONG(std::ceil(area[1] + sc.bottom * sy)) };
-        sc.left = std::max<LONG>(sc.left, 0);
-        sc.top = std::max<LONG>(sc.top, 0);
-        sc.right = std::min<LONG>(sc.right, rtW);
-        sc.bottom = std::min<LONG>(sc.bottom, rtH);
+        if (sc.right <= sc.left || sc.bottom <= sc.top) sc = { 0, 0, LONG(rt.gameW), LONG(kRtGameHeight) };
+        sc = { LONG(std::floor(sc.left * g_scale)), LONG(std::floor(sc.top * g_scale)),
+               LONG(std::ceil(sc.right * g_scale)), LONG(std::ceil(sc.bottom * g_scale)) };
+        sc.right = std::min<LONG>(sc.right, rt.hostW);
+        sc.bottom = std::min<LONG>(sc.bottom, rt.hostH);
+        if (sc.right <= sc.left || sc.bottom <= sc.top) return false;
 
         list->SetPipelineState(pso);
         list->SetGraphicsRootConstantBufferView(0, vsRaw);
@@ -750,6 +814,226 @@ namespace
         }
         else list->DrawInstanced(drawVertices, 1, 0, 0);
         return true;
+    }
+
+    ID3D12Resource* CreateTarget(uint32_t w, uint32_t h, bool renderTarget, D3D12_RESOURCE_STATES state)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = kRtFormat;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
+        D3D12_CLEAR_VALUE cv{ kRtFormat, { 0, 0, 0, 1 } };
+        ID3D12Resource* r = nullptr;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, renderTarget ? &cv : nullptr, IID_PPV_ARGS(&r)))) return nullptr;
+        return r;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE TargetRtv(uint32_t i)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_targetRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * g_targetRtvSize;
+        return h;
+    }
+
+    void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES& state, D3D12_RESOURCE_STATES to)
+    {
+        if (state == to) return;
+        Barrier(list, r, state, to);
+        state = to;
+    }
+
+    // The host surface a draw renders to: RB_SURFACE_INFO pitch (bits 0-13), RB_COLOR_INFO base (bits 0-11).
+    HostTarget* TargetFor(ID3D12GraphicsCommandList* list, const DrawRecord& d)
+    {
+        uint32_t pitch = d.Reg(xreg::RB_SURFACE_INFO) & 0x3FFF;
+        if (!pitch || pitch > 4096) pitch = 1280;
+        uint32_t base = d.Reg(xreg::RB_COLOR_INFO) & 0xFFF;
+        uint64_t key = (uint64_t(base) << 32) | pitch;
+        HostTarget& t = g_targets[key];
+        if (!t.res)
+        {
+            if (g_targetRtvFree.empty()) { g_targets.erase(key); return nullptr; }
+            t.rtv = g_targetRtvFree.back();
+            g_targetRtvFree.pop_back();
+            t.gameW = pitch;
+            t.hostW = uint32_t(std::ceil(pitch * g_scale));
+            t.hostH = uint32_t(std::ceil(kRtGameHeight * g_scale));
+            t.res = CreateTarget(t.hostW, t.hostH, true, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (!t.res) { g_targetRtvFree.push_back(t.rtv); g_targets.erase(key); return nullptr; }
+            g_dev->CreateRenderTargetView(t.res, nullptr, TargetRtv(t.rtv));
+            const float black[4] = { 0, 0, 0, 1 };
+            list->ClearRenderTargetView(TargetRtv(t.rtv), black, 0, nullptr);
+            Log("[draw] surface base %u pitch %u -> host target %ux%u", base, pitch, t.hostW, t.hostH);
+        }
+        return &t;
+    }
+
+    void Bind(ID3D12GraphicsCommandList* list, HostTarget& t)
+    {
+        Transition(list, t.res, t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = TargetRtv(t.rtv);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT vp{ 0, 0, float(t.gameW) * g_scale, float(kRtGameHeight) * g_scale, 0, 1 };
+        list->RSSetViewports(1, &vp);
+    }
+
+    // Resolve (RB_MODECONTROL copy): copy the scissor rectangle of the current surface into the
+    // texture at RB_COPY_DEST_BASE. RB_COPY_CONTROL: source select bits 0-2 (4 = depth);
+    // RB_COPY_DEST_PITCH: pitch bits 0-13, height 16-29; RB_COPY_DEST_INFO: dest_swap bit 24.
+    bool Resolve(ID3D12GraphicsCommandList* list, FrameResources& fr, const DrawRecord& d)
+    {
+        uint32_t control = d.Reg(0x2318);
+        if ((control & 7) >= 4) return false;   // depth resolves: not modelled
+        uint32_t dest = d.Reg(0x2319) & 0x1FFFF000u;
+        uint32_t pitchReg = d.Reg(0x231A), info = d.Reg(0x231B);
+        uint32_t dw = pitchReg & 0x3FFF, dh = (pitchReg >> 16) & 0x3FFF;
+        if (!dest || !dw || !dh) return false;
+        HostTarget* src = TargetFor(list, d);
+        if (!src) return false;
+        uint32_t tl = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_TL), br = d.Reg(xreg::PA_SC_WINDOW_SCISSOR_BR);
+        uint32_t x0 = tl & 0x7FFF, y0 = (tl >> 16) & 0x7FFF, x1 = br & 0x7FFF, y1 = (br >> 16) & 0x7FFF;
+        if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = dw; y1 = dh; }
+        x1 = std::min({ x1, dw, src->gameW });
+        y1 = std::min({ y1, dh, kRtGameHeight });
+        if (x1 <= x0 || y1 <= y0) return false;
+
+        ResolvedTexture& r = g_resolved[dest];
+        uint32_t hw = uint32_t(std::ceil(dw * g_scale)), hh = uint32_t(std::ceil(dh * g_scale));
+        if (!r.res || r.hostW != hw || r.hostH != hh)
+        {
+            if (r.res) fr.release.push_back(r.res);
+            for (auto& [sw, idx] : r.srvBySwizzle) g_cpuSrvFree.push_back(idx);
+            r.srvBySwizzle.clear();
+            r.res = CreateTarget(hw, hh, false, D3D12_RESOURCE_STATE_COPY_DEST);
+            r.state = D3D12_RESOURCE_STATE_COPY_DEST;
+            r.gameW = dw; r.gameH = dh; r.hostW = hw; r.hostH = hh;
+            if (!r.res) { g_resolved.erase(dest); return false; }
+            Log("[draw] resolve target %08X: %ux%u (host %ux%u)", dest, dw, dh, hw, hh);
+        }
+        bool swap = (info >> 24) & 1;
+        if (swap != r.swapRB)
+        {
+            r.swapRB = swap;
+            for (auto& [sw, idx] : r.srvBySwizzle) g_cpuSrvFree.push_back(idx);
+            r.srvBySwizzle.clear();
+        }
+        Transition(list, src->res, src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(list, r.res, r.state, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_BOX box{ UINT(x0 * g_scale), UINT(y0 * g_scale), 0,
+                       std::min<UINT>(UINT(std::ceil(x1 * g_scale)), std::min(src->hostW, hw)),
+                       std::min<UINT>(UINT(std::ceil(y1 * g_scale)), std::min(src->hostH, hh)), 1 };
+        if (box.right > box.left && box.bottom > box.top)
+        {
+            D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+            dl.pResource = r.res;
+            dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sl.pResource = src->res;
+            sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&dl, box.left, box.top, 0, &sl, &box);
+        }
+        Transition(list, r.res, r.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Bind(list, *src);
+        return true;
+    }
+
+    // ---- Present: scale a texture into the back buffer's game area ---------------------------
+    bool CreateBlitPso()
+    {
+        static const char* kVs =
+            "cbuffer Blit : register(b2, space4) { float4 g_Uv; };\n"
+            "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+            "V main(uint id : SV_VertexID) { V o; float2 p = float2((id << 1) & 2, id & 2);\n"
+            "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p * g_Uv.xy; return o; }\n";
+        static const char* kPs =
+            "Texture2D<float4> g_Tex[] : register(t0, space0);\n"
+            "SamplerState g_Smp[] : register(s0, space3);\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return float4(g_Tex[0].Sample(g_Smp[0], uv).rgb, 1); }\n";
+        std::vector<uint8_t> vs, ps;
+        std::string err;
+        if (!CompileHlsl(kVs, L"vs_6_0", vs, err) || !CompileHlsl(kPs, L"ps_6_0", ps, err))
+        {
+            Log("[draw] blit shader: %s", err.c_str());
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_rootSig;
+        pd.VS = { vs.data(), vs.size() };
+        pd.PS = { ps.data(), ps.size() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        return SUCCEEDED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_blitPso)));
+    }
+
+    void Blit(ID3D12GraphicsCommandList* list, FrameResources& fr, ID3D12Resource* tex, float u, float v,
+              size_t rtvHandle, const float area[4])
+    {
+        if (!g_blitPso || fr.srvUsed + kSlotsPerDraw > kSrvPerFrame) return;
+        uint32_t srvBase = uint32_t(&fr - g_frameRes.data()) * kSrvPerFrame + fr.srvUsed;
+        fr.srvUsed += kSlotsPerDraw;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        dst.ptr += SIZE_T(srvBase) * g_srvSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = kRtFormat;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g_dev->CreateShaderResourceView(tex, &sd, dst);
+        D3D12_SAMPLER_DESC samplers[kSlotsPerDraw]{};
+        for (auto& sm : samplers)
+        {
+            sm.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sm.AddressU = sm.AddressV = sm.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sm.MaxAnisotropy = 1;
+            sm.MaxLOD = D3D12_FLOAT32_MAX;
+        }
+        uint32_t smpBase = SamplerTable(samplers);
+        uint64_t cbVa;
+        float* cb = (float*)Alloc(fr, 256, 256, cbVa);
+        if (!cb) return;
+        cb[0] = u; cb[1] = v; cb[2] = cb[3] = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvHandle };
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT vp{ area[0], area[1], area[2], area[3], 0, 1 };
+        list->RSSetViewports(1, &vp);
+        D3D12_RECT sc{ LONG(area[0]), LONG(area[1]), LONG(area[0] + area[2] + 0.5f), LONG(area[1] + area[3] + 0.5f) };
+        list->RSSetScissorRects(1, &sc);
+        list->SetPipelineState(g_blitPso);
+        list->SetGraphicsRootConstantBufferView(2, cbVa);
+        D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        srvGpu.ptr += UINT64(srvBase) * g_srvSize;
+        D3D12_GPU_DESCRIPTOR_HANDLE smpGpu = g_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+        smpGpu.ptr += UINT64(smpBase) * g_samplerSize;
+        list->SetGraphicsRootDescriptorTable(5, srvGpu);
+        list->SetGraphicsRootDescriptorTable(8, smpGpu);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // Drop all surfaces and resolved textures (scale change); resources freed with the frame slot.
+    void ResetEdram(FrameResources& fr)
+    {
+        for (auto& [k, t] : g_targets) { fr.release.push_back(t.res); g_targetRtvFree.push_back(t.rtv); }
+        g_targets.clear();
+        for (auto& [a, r] : g_resolved)
+        {
+            fr.release.push_back(r.res);
+            for (auto& [sw, idx] : r.srvBySwizzle) g_cpuSrvFree.push_back(idx);
+        }
+        g_resolved.clear();
     }
 }
 
@@ -792,11 +1076,18 @@ bool DrawInit(ID3D12Device* device, uint32_t framesInFlight)
         D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
     sd.Texture2D.MipLevels = 1;
     g_dev->CreateShaderResourceView(g_dummyTexture, &sd, CpuSrv(0));
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = kTargetRtvCount;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_targetRtvHeap)))) return false;
+    g_targetRtvSize = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (uint32_t i = kTargetRtvCount; i-- > 0;) g_targetRtvFree.push_back(i);
+    if (!CreateBlitPso()) return false;
     Log("[draw] D3D12 draw translation ready");
     return true;
 }
 
-uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtW, uint32_t rtH, const float area[4], const DrawList& draws, uint32_t frameSlot)
+uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t rtW, uint32_t rtH, const float area[4], const DrawList& draws, uint32_t frontBuffer, uint32_t frameSlot)
 {
     if (!g_rootSig || frameSlot >= g_frameRes.size()) return 0;
     FrameResources& fr = g_frameRes[frameSlot];
@@ -813,17 +1104,81 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
         dummyReady = true;
     }
 
+    // Native resolution: surfaces are rendered at the back buffer's scale (at least 1).
+    float scale = std::max(1.0f, area[2] / kGameWidth);
+    if (std::fabs(scale - g_scale) > 0.001f)
+    {
+        ResetEdram(fr);
+        g_scale = scale;
+        Log("[draw] render scale %.2f", g_scale);
+    }
+    (void)rtW; (void)rtH;
+
     ID3D12DescriptorHeap* heaps[] = { g_srvHeap, g_samplerHeap };
     list->SetDescriptorHeaps(2, heaps);
     list->SetGraphicsRootSignature(g_rootSig);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvHandle };
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    D3D12_VIEWPORT vp{ area[0], area[1], area[2], area[3], 0, 1 };
-    list->RSSetViewports(1, &vp);
 
+    // PEGGLE2_DUMP_FRAME=<n>: log the render state of every draw of host frame n (debugging aid).
+    static const uint64_t dumpFrame = getenv("PEGGLE2_DUMP_FRAME") ? strtoull(getenv("PEGGLE2_DUMP_FRAME"), nullptr, 10) : 0;
+    if (g_frameCounter == dumpFrame)
+    {
+        Log("[dump] frame %llu: %zu draws", (unsigned long long)g_frameCounter, draws.size());
+        for (size_t k = 0; k < draws.size(); k++)
+        {
+            const DrawRecord& d = *draws[k];
+            char tex[160] = "";
+            size_t at = 0;
+            for (uint32_t s = 0; s < 32 && at < sizeof(tex) - 24; s++)
+            {
+                const uint32_t* f = d.fetch + s * 6;
+                if ((f[0] & 3) == 3 || !(f[1] >> 12)) continue;
+                at += snprintf(tex + at, sizeof(tex) - at, " t%u=%05X/%ux%u/f%u", s, f[1] >> 12, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, f[1] & 0x3F);
+            }
+            Log("[dump] %3zu mode %u surf %08X color %08X copy %08X %08X %08X %08X clr %08X %08X %08X %08X win %08X %08X prim %u n %u vs %04llX ps %04llX%s",
+                k, d.Reg(0x2208) & 7, d.Reg(0x2000), d.Reg(0x2001), d.Reg(0x2318), d.Reg(0x2319), d.Reg(0x231A), d.Reg(0x231B),
+                d.Reg(0x231C), d.Reg(0x231D), d.Reg(0x231E), d.Reg(0x231F), d.Reg(0x2080), d.Reg(0x2082), d.prim, d.numIndices,
+                (unsigned long long)(d.vsHash >> 48), (unsigned long long)(d.psHash >> 48), tex);
+        }
+    }
+
+    // RB_MODECONTROL edram mode: 4 colour+depth, 5 depth only, 6 copy (resolve).
     uint32_t executed = 0;
-    for (const auto& d : draws)
-        if (ExecuteDraw(list, fr, *d, rtW, rtH, area)) executed++;
+    HostTarget* bound = nullptr;
+    for (const auto& dp : draws)
+    {
+        const DrawRecord& d = *dp;
+        uint32_t mode = d.Reg(0x2208) & 7;
+        if (mode == 6)
+        {
+            if (Resolve(list, fr, d)) executed++;
+            bound = TargetFor(list, d);   // Resolve re-binds its source surface
+            continue;
+        }
+        if (mode != 4) continue;
+        HostTarget* t = TargetFor(list, d);
+        if (!t) continue;
+        if (t != bound || t->state != D3D12_RESOURCE_STATE_RENDER_TARGET) { Bind(list, *t); bound = t; }
+        if (ExecuteDraw(list, fr, d, *t)) executed++;
+    }
+
+    // Present the texture VdSwap displays (else the widest surface), scaled into the game area.
+    auto front = frontBuffer ? g_resolved.find(frontBuffer) : g_resolved.end();
+    if (front != g_resolved.end() && front->second.res)
+    {
+        auto& r = front->second;
+        Transition(list, r.res, r.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Blit(list, fr, r.res, std::min(1.0f, kGameWidth / r.gameW), std::min(1.0f, kGameHeight / r.gameH), rtvHandle, area);
+    }
+    else
+    {
+        HostTarget* widest = nullptr;
+        for (auto& [k, t] : g_targets) if (!widest || t.gameW > widest->gameW) widest = &t;
+        if (widest)
+        {
+            Transition(list, widest->res, widest->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Blit(list, fr, widest->res, std::min(1.0f, kGameWidth / widest->gameW), kGameHeight / kRtGameHeight, rtvHandle, area);
+        }
+    }
 
     // Drop textures unused for ~10 s (the resource goes away when this slot comes back).
     if ((g_frameCounter % 600) == 0)
