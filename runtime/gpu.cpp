@@ -28,9 +28,54 @@ namespace
     constexpr uint32_t REG_SCRATCH_REG0 = 0x0578;
     constexpr uint32_t REG_COHER_STATUS_HOST = 0x0A31;
 
+    // ---- Draw / texture state ------------------------------------------------------------------
+    // Texture fetch constants: 32 slots x 6 dwords at register 0x4800 (layout as in Xenia's
+    // xe_gpu_texture_fetch_t): dword0 type:2 (2 = texture) ... pitch:9 @22 (texels/32),
+    // tiled:1 @31; dword1 format:6, endian:2 @6, base_address:20 @12 (physical >> 12);
+    // dword2 width-1:13, height-1:13 @13.
+    constexpr uint32_t REG_FETCH_CONSTANTS = 0x4800;
+    std::mutex g_frameLock;
+    GuestTextureInfo g_frameBest{};      // largest texture bound by a draw this frame
+    uint64_t g_frameBestArea = 0;
+    std::atomic<uint64_t> g_draws{ 0 };
+    uint32_t g_frameDraws = 0;
+
+    uint32_t* RegsPtr();
+
+    void OnDraw()
+    {
+        g_draws++;
+        g_frameDraws++;
+        const uint32_t* regs = RegsPtr();
+        std::lock_guard<std::mutex> g(g_frameLock);
+        for (uint32_t slot = 0; slot < 32; slot++)
+        {
+            const uint32_t* f = regs + REG_FETCH_CONSTANTS + slot * 6;
+            // Type is dword0 bits 0-1: 3 = vertex fetch. Peggle 2's texture constants carry
+            // type 0 (not 2 as expected), so accept anything that isn't a vertex constant.
+            if ((f[0] & 3) == 3) continue;
+            uint32_t base = (f[1] >> 12) & 0xFFFFF;
+            if (!base) continue;
+            uint32_t w = (f[2] & 0x1FFF) + 1, h = ((f[2] >> 13) & 0x1FFF) + 1;
+            if (w < 16 || h < 16 || w > 4096 || h > 4096) continue;
+            uint64_t area = uint64_t(w) * h;
+            if (area < g_frameBestArea) continue;
+            g_frameBestArea = area;
+            g_frameBest.address = 0xA0000000u | (base << 12);
+            g_frameBest.width = w;
+            g_frameBest.height = h;
+            g_frameBest.pitch = ((f[0] >> 22) & 0x1FF) * 32;
+            g_frameBest.tiled = (f[0] >> 31) & 1;
+            g_frameBest.format = f[1] & 0x3F;
+            g_frameBest.endian = (f[1] >> 6) & 3;
+        }
+    }
+
     // PM4 type-3 opcodes
     enum : uint32_t
     {
+        PM4_DRAW_INDX = 0x22, PM4_DRAW_INDX_2 = 0x36,
+        PM4_SET_CONSTANT = 0x2D, PM4_LOAD_ALU_CONSTANT = 0x2F, PM4_SET_CONSTANT2 = 0x55, PM4_SET_SHADER_CONSTANTS = 0x56,
         PM4_NOP = 0x10, PM4_REG_RMW = 0x21, PM4_INDIRECT_BUFFER_PFD = 0x37, PM4_WAIT_REG_MEM = 0x3C,
         PM4_MEM_WRITE = 0x3D, PM4_INDIRECT_BUFFER = 0x3F, PM4_COND_WRITE = 0x45, PM4_EVENT_WRITE = 0x46,
         PM4_ME_INIT = 0x48, PM4_INTERRUPT = 0x54, PM4_EVENT_WRITE_SHD = 0x58, PM4_EVENT_WRITE_EXT = 0x59,
@@ -207,11 +252,36 @@ namespace
         }
     }
 
+    // Packet statistics (debugging aid): type-3 opcode histogram and type-0 register blocks.
+    std::atomic<uint64_t> g_opHist[128];
+    std::atomic<uint64_t> g_regBlockHist[16];   // by register index >> 12
+
+    void DumpPacketStats()
+    {
+        Log("[gpu] packet stats: type-3 opcodes (count):");
+        for (int op = 0; op < 128; op++)
+            if (uint64_t n = g_opHist[op].load()) Log("[gpu]   op 0x%02X: %llu", op, (unsigned long long)n);
+        for (int b = 0; b < 16; b++)
+            if (uint64_t n = g_regBlockHist[b].load()) Log("[gpu]   type-0 writes to regs 0x%X000-0x%XFFF: %llu", b, b, (unsigned long long)n);
+        for (uint32_t slot = 0; slot < 32; slot++)
+        {
+            const uint32_t* f = g_regs + 0x4800 + slot * 6;
+            if (f[0] | f[1] | f[2] | f[3] | f[4] | f[5])
+                Log("[gpu]   fetch slot %2u: %08X %08X %08X %08X %08X %08X", slot, f[0], f[1], f[2], f[3], f[4], f[5]);
+        }
+        // Non-zero registers in 0x4800-0x48FF and a sample of 0x5000-0x5FFF.
+        uint32_t shown = 0;
+        for (uint32_t i = 0x5000; i < 0x6000 && shown < 24; i++)
+            if (g_regs[i]) { Log("[gpu]   reg 0x%04X = %08X", i, g_regs[i]); shown++; }
+    }
+
     void ExecutePacket(Reader& r, int depth)
     {
         uint32_t headerPos = r.pos;
         uint32_t header = r.Read();
         g_packets++;
+        if ((header >> 30) == 3) g_opHist[(header >> 8) & 0x7F]++;
+        else if ((header >> 30) == 0) g_regBlockHist[((header & 0x7FFF) >> 12) & 15]++;
         {
             // Peek at the first three payload dwords for the history (no consumption).
             Reader peek = r;
@@ -318,7 +388,41 @@ namespace
                 if (cpuMask & (1u << cpu)) CallInterrupt(1, cpu);
             break;
         }
-        default:   // ME_INIT, NOP, EVENT_WRITE(_EXT/_ZPD), draws, constants, state: skipped
+        case PM4_DRAW_INDX:
+        case PM4_DRAW_INDX_2:
+            OnDraw();   // not executed yet: record the textures it uses
+            break;
+        // Constant uploads. The type byte of SET_CONSTANT / LOAD_ALU_CONSTANT selects the
+        // register block: 0 ALU 0x4000, 1 FETCH 0x4800, 2 BOOL 0x4900, 3 LOOP 0x4908, 4 REGS 0x2000.
+        case PM4_SET_CONSTANT:
+        case PM4_LOAD_ALU_CONSTANT:
+        {
+            static const uint32_t kBlockBase[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+            uint32_t address = 0, sizeDwords = count - 1;
+            if (opcode == PM4_LOAD_ALU_CONSTANT) address = r.Read() & 0x3FFFFFFF;
+            uint32_t offsetType = r.Read();
+            uint32_t type = (offsetType >> 16) & 0xFF;
+            if (type > 4) break;
+            uint32_t index = kBlockBase[type] + (offsetType & 0x7FF);
+            if (opcode == PM4_LOAD_ALU_CONSTANT)
+            {
+                sizeDwords = r.Read() & 0xFFF;
+                for (uint32_t n = 0; n < sizeDwords; n++) WriteRegister(index + n, Load32(PhysToGuest(address + n * 4)));
+            }
+            else
+            {
+                for (uint32_t n = 0; n + 1 < count; n++) WriteRegister(index + n, r.Read());
+            }
+            break;
+        }
+        case PM4_SET_CONSTANT2:
+        case PM4_SET_SHADER_CONSTANTS:
+        {
+            uint32_t index = r.Read() & 0xFFFF;
+            for (uint32_t n = 0; n + 1 < count; n++) WriteRegister(index + n, r.Read());
+            break;
+        }
+        default:   // ME_INIT, NOP, EVENT_WRITE(_EXT/_ZPD), constants, state: skipped
             break;
         }
         // Consume whatever the handler did not read, so packets stay aligned.
@@ -370,6 +474,8 @@ namespace
     }
 
     void StartGpu() { std::call_once(g_startOnce, [] { std::thread(GpuThread).detach(); }); }
+
+    uint32_t* RegsPtr() { return g_regs; }
 }
 
 // ---- Display queries ---------------------------------------------------------------------------
@@ -527,8 +633,23 @@ IMPORT(VdSwap)
         for (uint32_t i = 1; i < 64; i++) Store32(buf + i * 4, 0);
     }
     uint32_t n = ++g_swaps;
-    RendererPresent();
-    if (n <= 3 || (n % 600) == 0) Log("[gpu] VdSwap #%u", n);
+    // Hand the frame's main texture to the renderer, then start a new frame.
+    GuestTextureInfo best;
+    uint32_t frameDraws;
+    {
+        std::lock_guard<std::mutex> g(g_frameLock);
+        best = g_frameBest;
+        frameDraws = g_frameDraws;
+        g_frameBest = {};
+        g_frameBestArea = 0;
+        g_frameDraws = 0;
+    }
+    RendererPresent(best.address ? &best : nullptr);
+    if (n <= 3 || (n % 600) == 0)
+        Log("[gpu] VdSwap #%u: %u draws this frame (%llu total); main texture %ux%u fmt %u endian %u %s at 0x%08X",
+            n, frameDraws, (unsigned long long)g_draws.load(), best.width, best.height, best.format, best.endian,
+            best.tiled ? "tiled" : "linear", best.address);
     if (n == 300 || n == 1200) DumpShaderContainers();   // after loading screens have run
+    if (n == 600) DumpPacketStats();
     ctx.r3.u64 = 0;
 }

@@ -88,9 +88,22 @@ void Log(const char* fmt, ...);
 extern thread_local const char* g_lastImport;
 // Guest object the current thread is blocked on (0 when not waiting); read by the watchdog.
 extern thread_local std::atomic<uint32_t> t_waitingOn;
+// A texture as described by a Xenos texture fetch constant (decoded in gpu.cpp).
+struct GuestTextureInfo
+{
+    uint32_t address = 0;      // guest address of mip 0 (0xA0000000 | physical)
+    uint32_t width = 0, height = 0;
+    uint32_t pitch = 0;        // row pitch in texels (multiple of 32)
+    uint32_t format = 0;       // xenos TextureFormat
+    uint32_t endian = 0;       // 0 none, 1 8in16, 2 8in32, 3 16in32
+    bool tiled = false;
+};
+
 // Host renderer (render.cpp): window + D3D12 swap chain; RendererPresent() once per VdSwap.
+// `preview` (may be null) is the frame's largest bound texture, shown until draws are
+// translated.
 void StartRenderer();
-void RendererPresent();
+void RendererPresent(const GuestTextureInfo* preview);
 
 // Log the guest call chain of the calling host thread (for hooks).
 void LogGuestBacktrace();
