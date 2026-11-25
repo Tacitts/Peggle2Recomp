@@ -527,6 +527,7 @@ IMPORT(VdSwap)
         for (uint32_t i = 1; i < 64; i++) Store32(buf + i * 4, 0);
     }
     uint32_t n = ++g_swaps;
+    RendererPresent();
     if (n <= 3 || (n % 600) == 0) Log("[gpu] VdSwap #%u", n);
     if (n == 300 || n == 1200) DumpShaderContainers();   // after loading screens have run
     ctx.r3.u64 = 0;

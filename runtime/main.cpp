@@ -347,6 +347,7 @@ int main(int argc, char** argv)
     InitImports(xex.data(), xex.size());
 
     StartWatchdog(10);
+    StartRenderer();
 
     PPCContext ctx{};
     InitGuestThread(ctx, 1024 * 1024, 1);

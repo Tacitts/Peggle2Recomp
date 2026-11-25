@@ -88,6 +88,10 @@ void Log(const char* fmt, ...);
 extern thread_local const char* g_lastImport;
 // Guest object the current thread is blocked on (0 when not waiting); read by the watchdog.
 extern thread_local std::atomic<uint32_t> t_waitingOn;
+// Host renderer (render.cpp): window + D3D12 swap chain; RendererPresent() once per VdSwap.
+void StartRenderer();
+void RendererPresent();
+
 // Log the guest call chain of the calling host thread (for hooks).
 void LogGuestBacktrace();
 // Log the guest call chain of another host thread (HANDLE), sampled safely (watchdog).

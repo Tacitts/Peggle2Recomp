@@ -21,6 +21,7 @@ add_executable(Peggle2
     xam.cpp
     net.cpp
     input.cpp
+    render.cpp
     generated/import_stubs.cpp
 )
 target_include_directories(Peggle2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
