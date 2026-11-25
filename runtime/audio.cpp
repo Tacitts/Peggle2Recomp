@@ -132,6 +132,9 @@ namespace
     constexpr uint32_t kDriverMagic = 0x41550000;
     constexpr auto kFramePeriod = std::chrono::nanoseconds(1'000'000'000ll * 256 / 48000);
 
+    void LogXmaContexts();
+    std::vector<uint32_t> LiveXmaContexts();
+
     void AudioThread()
     {
         PPCContext ctx{};
@@ -148,6 +151,7 @@ namespace
                 std::lock_guard<std::mutex> g(g_lock);
                 clients = g_clients;
             }
+            XmaTick(LiveXmaContexts());   // hardware XMA decoding, before the clients mix
             for (auto& c : clients)
             {
                 if (!c.active) continue;
@@ -160,7 +164,9 @@ namespace
             if (std::chrono::steady_clock::now() >= nextPeakLog)
             {
                 nextPeakLog += std::chrono::seconds(10);
-                Log("[audio] peak level over the last 10 s: %.3f", g_peak.exchange(0.0f));
+                Log("[audio] peak level over the last 10 s: %.3f, XMA packets decoded: %llu", g_peak.exchange(0.0f),
+                    (unsigned long long)XmaPacketsDecoded());
+                LogXmaContexts();
             }
             // Log on crossing thresholds (several clients advance the counter per tick).
             static uint64_t lastBucket = 0;
@@ -249,10 +255,50 @@ IMPORT(XAudioGetDuckerHoldTime) { if (ctx.r3.u32) Store32(ctx.r3.u32, 0); ctx.r3
 // ---- XMA ------------------------------------------------------------------------------------
 // XMACreateContext(u32* contextOut): a 64-byte hardware context the title fills in and the
 // XMA decoder consumes. No decoder yet: contexts are plain memory.
+namespace
+{
+    std::mutex g_xmaLock;
+    std::vector<uint32_t> g_xmaContexts;   // guest addresses of live contexts
+
+    std::vector<uint32_t> LiveXmaContexts()
+    {
+        std::lock_guard<std::mutex> g(g_xmaLock);
+        return g_xmaContexts;
+    }
+
+    // Debugging aid: the live contexts' 10 dwords (Xenia's XMA_CONTEXT_DATA layout).
+    void LogXmaContexts()
+    {
+        std::lock_guard<std::mutex> g(g_xmaLock);
+        int shown = 0;
+        for (uint32_t c : g_xmaContexts)
+        {
+            uint32_t d[10];
+            bool any = false;
+            for (int i = 0; i < 10; i++) { d[i] = Load32(c + i * 4); any |= d[i] != 0; }
+            if (!any || shown++ >= 6) continue;
+            Log("[xma] ctx %08X: %08X %08X %08X %08X %08X in0 %08X in1 %08X out %08X work %08X d9 %08X",
+                c, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+        }
+        Log("[xma] %zu live contexts", g_xmaContexts.size());
+    }
+}
+
 IMPORT(XMACreateContext)
 {
     uint32_t c = AllocPhysical(0x40, 0x40);
     if (ctx.r3.u32) Store32(ctx.r3.u32, c);
+    if (c)
+    {
+        memset(GuestPtr(c), 0, 0x40);
+        std::lock_guard<std::mutex> g(g_xmaLock);
+        g_xmaContexts.push_back(c);
+    }
     ctx.r3.u64 = c ? 0 : 0x8007000E;
 }
-IMPORT(XMAReleaseContext) { ctx.r3.u64 = 0; }
+IMPORT(XMAReleaseContext)
+{
+    std::lock_guard<std::mutex> g(g_xmaLock);
+    g_xmaContexts.erase(std::remove(g_xmaContexts.begin(), g_xmaContexts.end(), ctx.r3.u32), g_xmaContexts.end());
+    ctx.r3.u64 = 0;
+}

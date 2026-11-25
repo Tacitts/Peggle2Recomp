@@ -99,6 +99,10 @@ struct GuestTextureInfo
     bool tiled = false;
 };
 
+// XMA decoder emulation (xma.cpp): decode the live contexts once per audio tick.
+void XmaTick(const std::vector<uint32_t>& contexts);
+uint64_t XmaPacketsDecoded();
+
 // Save a shader container found at a guest address (gpu.cpp). Returns false if it isn't one.
 bool SaveShaderContainer(uint32_t addr, const char* source);
 

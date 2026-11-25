@@ -38,6 +38,8 @@ add_executable(Peggle2
     hooks.cpp
     xam.cpp
     content.cpp
+    xma.cpp
+    xmsg.cpp
     net.cpp
     input.cpp
     render.cpp
@@ -51,6 +53,20 @@ target_compile_options(Peggle2 PRIVATE /clang:-march=sandybridge -Wno-unused-par
 set_source_files_properties(xenos_shader.cpp PROPERTIES COMPILE_OPTIONS "/FI${XENOS}/XenosRecomp/pch.h;-Wno-switch")
 target_link_options(Peggle2 PRIVATE /DEBUG)
 target_link_libraries(Peggle2 PRIVATE Peggle2Recomp XenonUtils XenosShaderRecompiler ws2_32 dbghelp xinput)
+
+# Optional: FFmpeg's libavcodec for XMA audio (xma.cpp), from vcpkg at ../vcpkg next to the repo:
+#   vcpkg install "ffmpeg[core,avcodec]:x64-windows-static"
+# Without it the build still works; XMA music and effects stay silent.
+set(PEGGLE2_FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../vcpkg/installed/x64-windows-static" CACHE PATH "vcpkg installed tree with FFmpeg")
+if (EXISTS "${PEGGLE2_FFMPEG_ROOT}/include/libavcodec/avcodec.h")
+    target_compile_definitions(Peggle2 PRIVATE PEGGLE2_HAVE_FFMPEG)
+    target_include_directories(Peggle2 PRIVATE ${PEGGLE2_FFMPEG_ROOT}/include)
+    target_link_libraries(Peggle2 PRIVATE ${PEGGLE2_FFMPEG_ROOT}/lib/avcodec.lib ${PEGGLE2_FFMPEG_ROOT}/lib/avutil.lib
+        bcrypt mfuuid strmiids ole32 user32)
+    message(STATUS "FFmpeg found in ${PEGGLE2_FFMPEG_ROOT}: XMA audio enabled")
+else()
+    message(STATUS "FFmpeg not found (${PEGGLE2_FFMPEG_ROOT}): XMA audio disabled")
+endif()
 
 # DXC runtime (loaded by xenos_shader.cpp) next to the executable.
 add_custom_command(TARGET Peggle2 POST_BUILD

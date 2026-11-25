@@ -27,6 +27,16 @@ git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-peggle2-opcodes.p
 git -C third_party/XenosRecomp apply ../../patches/xenosrecomp-peggle2.patch
 ```
 
+Optional, for music and sound effects (XMA audio): FFmpeg's codec library from vcpkg, cloned
+next to this repository (`../vcpkg`, e.g. `C:\dev\vcpkg` for a clone at `C:\dev\Peggle2Recomp`).
+The first build takes 20-40 minutes. Without it everything builds and runs; XMA sounds are silent.
+
+```powershell
+git clone https://github.com/microsoft/vcpkg ..\vcpkg
+..\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+..\vcpkg\vcpkg install "ffmpeg[core,avcodec]:x64-windows-static"
+```
+
 Then follow "Reproduce" below, pointing `stfs_extract.py` at your own Peggle 2 package file
 (the `58411436\000D0000\...` file from your console/storage device).
 
@@ -56,7 +66,7 @@ written by `xexdump --dump-image`.
 | 4i. Saves / content | Done (`content.cpp`). Device selector picks the one hard drive (device 1), `XamContentGetDeviceData`, `XamContentCreateEx/Close/Delete` with packages in `userdata/content/<type>/<file name>/` mounted at their root name (`savegame:`). A missing package returns `X_ERROR_PATH_NOT_FOUND`, and overlapped extended errors are `HRESULT_FROM_WIN32` (as in Xenia): with `FILE_NOT_FOUND` the game retried opening `PROFILE` forever. The game now creates and reloads its `PROFILE` save and reaches the main menu. |
 | 4j. Input | Done (`input.cpp`). Guest controller 1 merges the first host XInput controller (same `XINPUT_GAMEPAD` layout), the keyboard and `PEGGLE2_AUTOPRESS`. Keys come from the game window's own `WM_KEYDOWN/UP` (render.cpp), so they follow focus and work with injected input; a press is latched until the next poll so taps shorter than a frame still count. Keys: arrows = D-pad, Space/Z = A, Esc/X = B, C = X, V = Y, Enter/P = Start, Tab/Backspace = Back, Q/E = LB/RB, Shift/Ctrl = LT/RT, WASD = left stick, IJKL = right stick. Verified: key presses reach the game as buttons and move it from the title into the main menu. Reaching a level by hand needs to see the menus, i.e. real draws (4h). |
 | 4l. Display | Done (`render.cpp`). Resizable window; F11 or Alt+Enter toggles borderless fullscreen (these keys are not passed to the game); the 1280x720 frame is letterboxed and rendered at the window's resolution. |
-| 4k. XMA decoding | Not started. Host output works (the intro movie's sound plays, peak 1.0), but the menus are silent (peak ~0.01): the game's music and effects are XMA-compressed and the hardware XMA decoder (contexts from `XMACreateContext`, MMIO at `0x7FEA0000`) is not emulated. Needs an XMA2 (WMA Pro) decoder, e.g. FFmpeg's, as Xenia uses. |
+| 4k. XMA decoding | Done, needs listening tests (`xma.cpp`, FFmpeg's xma2 decoder). Each audio tick, before the render-driver clients mix, every live context (Xenia's documented `XMA_CONTEXT_DATA` layout) with a valid output ring and input buffer is decoded: 2 KB XMA2 packets to 16-bit big-endian PCM in 256-byte blocks, write offset advanced, finished input buffers invalidated and the other buffer taken; a read offset moved by the title restarts the decoder there. The title reads the output: its read offset follows ours. In the menus, ~1,200 packets/min decode (music: 48 kHz stereo, streamed in ~8-packet buffers, decoded peak ~0.4); a test tone (`PEGGLE2_XMA_TEST=1`) confirms decoded audio reaches the mix, but the menu mix peaks at only ~0.04, so check by ear whether music and effects sound right and loud enough. Needs FFmpeg from vcpkg (see Setup). The log reports per-context packets and decoded peak every 10 s. |
 
 ## Layout
 
@@ -160,7 +170,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run.ps1 -Seconds 30
 | `fs.cpp` | Handle table, `Nt*File` on the host file system |
 | `threads.cpp` | Threads, events, semaphores, mutants, timers, waits, spinlocks, `Ob*`, DPCs, thread-name exceptions. All waitable state lives in the guest `DISPATCHER_HEADER`, guarded by one global lock + condition variable. |
 | `gpu.cpp` | Video driver (`Vd*`) imports, the PM4 command processor, shader microcode capture (`IM_LOAD*`) and per-draw records for the renderer |
-| `audio.cpp` | XAudio render driver (client callback every 256-sample frame, called with a pointer to its argument), XMA contexts, voice/ducker queries |
+| `audio.cpp` | XAudio render driver (client callback every 256-sample frame, called with a pointer to its argument), host output through WASAPI, XMA context allocation, voice/ducker queries |
+| `xma.cpp` | XMA decoder emulation on FFmpeg (optional at build time) |
+| `xmsg.cpp` | `XMsg*` requests to system apps; the dashboard music player (0xFA) reports idle with the title in control of playback |
 | `xam.cpp` | Notification listeners (sign-in notification posted to system listeners), signed-in profile (`XamUserGetSigninInfo/State/XUID/Name`, privileges), profile settings read/write with persistence, license mask, `CompleteOverlapped()` for async XAM calls |
 | `net.cpp` | No Xbox Live / no address, but a stable MAC in `XNADDR` (RakNet's GUID) and real sockets on host Winsock (`IPPROTO_VDP` 254 mapped to UDP). Most `NetDll_` calls take a leading `caller` argument; `inet_addr`, `WSACreateEvent`, `WSACloseEvent` do not. |
 | `content.cpp` | Storage device selector and device data (one hard drive), content packages (`XamContentCreateEx/Close/Delete`) as host directories mounted at their root name |
@@ -286,5 +298,4 @@ GPU data through the `0xC0000000` alias. Built with placeholder reservations
    resolves that the CPU reads back. Play further into the game to find shaders and draw types not seen yet.
 2. **Audio output:** WASAPI from `XAudioSubmitRenderDriverFrame` (256 samples x 6 channels,
    big-endian floats), and XMA decoding for the game's compressed sounds.
-3. **XMsg system apps:** answer the music player (0xFA) the way the dashboard would.
 4. **Instruction tests:** run XenonRecomp's test suite to check the new opcodes.
