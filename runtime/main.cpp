@@ -285,8 +285,31 @@ static std::filesystem::path FindGameDir(int argc, char** argv)
 
 std::filesystem::path g_gameDir;
 
+// Keep the previous run's log (crash reports!) in logs/<timestamp>.log; the 10 newest are kept.
+static void RotateLogs()
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists("peggle2_runtime.log", ec)) return;
+    fs::create_directories("logs", ec);
+    auto written = fs::last_write_time("peggle2_runtime.log", ec);
+    auto sys = std::chrono::clock_cast<std::chrono::system_clock>(written);
+    std::time_t t = std::chrono::system_clock::to_time_t(sys);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char name[64];
+    strftime(name, sizeof(name), "logs/peggle2_%Y%m%d-%H%M%S.log", &tm);
+    fs::rename("peggle2_runtime.log", name, ec);
+    std::vector<fs::path> old;
+    for (auto& e : fs::directory_iterator("logs", ec))
+        if (e.path().extension() == ".log") old.push_back(e.path());
+    std::sort(old.begin(), old.end());
+    for (size_t i = 0; i + 10 < old.size(); i++) fs::remove(old[i], ec);
+}
+
 int main(int argc, char** argv)
 {
+    RotateLogs();
     g_logFile = fopen("peggle2_runtime.log", "w");
     AddVectoredExceptionHandler(1, CrashHandler);
 

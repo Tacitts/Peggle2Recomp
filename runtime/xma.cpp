@@ -53,7 +53,10 @@ namespace
         std::vector<uint8_t> packetData;
         uint64_t packets = 0;
         float peak = 0;                              // decoded peak since the last log (debugging)
-        uint32_t switches = 0;
+        uint32_t switches = 0, seeks = 0, reopens = 0, restarts = 0;
+        uint32_t lastWrite = 0xFFFFFFFF;             // output write offset we last left
+        bool ended = false;                          // input ran out (next valid input = new sound)
+        uint32_t lastLoop[3] = {};                   // loop count, start, end seen (debugging)
         ~HostContext()
         {
             av_frame_free(&frame);
@@ -129,31 +132,45 @@ namespace
         g_totalPackets++;
     }
 
+    // Start a sound over: the title re-armed the context (reset the output ring, moved the read
+    // position, or gave new input after the previous sound ran out).
+    void Restart(HostContext& h)
+    {
+        avcodec_flush_buffers(h.codec);
+        h.pending.clear();
+    }
+
     void ProcessContext(uint32_t addr, HostContext& h)
     {
-        uint32_t d[10];
-        for (int i = 0; i < 10; i++) d[i] = Load32(addr + i * 4);
+        uint32_t d[10], o[10];
+        for (int i = 0; i < 10; i++) o[i] = d[i] = Load32(addr + i * 4);
         if (!Bits(d[1], 31, 1)) return;                      // output buffer not valid
         uint32_t blocks = Bits(d[0], 22, 5);
         uint32_t outPtr = d[7];
         if (!blocks || !outPtr) return;
         uint32_t rate = kSampleRates[Bits(d[1], 27, 2)], channels = Bits(d[1], 29, 1) ? 2 : 1;
-        uint32_t current = Bits(d[4], 31, 1);
-        uint32_t inPtr = current ? d[6] : d[5];
-        if (!h.codec || h.rate != rate || h.channels != channels || h.inputPtr != inPtr)
+        // The decoder keeps its state across input buffers (frames span packets and buffers);
+        // it is only rebuilt when the format changes.
+        if (!h.codec || h.rate != rate || h.channels != channels)
         {
             if (!OpenDecoder(h, rate, channels)) return;
-            h.inputPtr = inPtr;
+            h.reopens++;
             h.expectedReadOffset = 0xFFFFFFFF;
+            h.lastWrite = 0xFFFFFFFF;
         }
+        uint32_t current = Bits(d[4], 31, 1);
         uint32_t write = Bits(d[0], 27, 5), read = Bits(d[9], 0, 5);
+        if (h.lastWrite != 0xFFFFFFFF && write != h.lastWrite) { Restart(h); h.restarts++; }   // ring reset by the title
+        if (h.ended && Bits(d[0], current ? 21 : 20, 1)) { Restart(h); h.ended = false; }      // new input after the end
+        h.lastLoop[0] = Bits(d[0], 12, 8);
+        h.lastLoop[1] = Bits(d[3], 0, 26);
+        h.lastLoop[2] = Bits(d[4], 0, 26);
         bool changed = false;
         for (;;)
         {
             // Free blocks in the ring (write == read means empty).
             uint32_t used = (write + blocks - read) % blocks;
             uint32_t freeBlocks = blocks - 1 - used;
-            // Write whole blocks from pending output.
             while (freeBlocks && h.pending.size() >= kBlockBytes)
             {
                 memcpy(GuestPtr(0xA0000000u | (outPtr + write * kBlockBytes)), h.pending.data(), kBlockBytes);
@@ -164,29 +181,30 @@ namespace
             }
             if (!freeBlocks) break;
 
-            // Need more input: the current buffer, from the read offset.
             uint32_t validBit = current ? 21 : 20;
-            if (!Bits(d[0], validBit, 1)) break;
+            if (!Bits(d[0], validBit, 1))
+            {
+                h.ended = true;   // starved or finished: the next valid input starts fresh
+                break;
+            }
             uint32_t count = current ? Bits(d[1], 0, 12) : Bits(d[0], 0, 12);
             uint32_t readOffset = Bits(d[2], 0, 26);
-            if (readOffset != h.expectedReadOffset)
+            if (h.expectedReadOffset != 0xFFFFFFFF && readOffset != h.expectedReadOffset)
             {
-                avcodec_flush_buffers(h.codec);   // the title moved the read position: start over there
-                h.pending.clear();
+                h.seeks++;
+                Restart(h);       // the title moved the read position
             }
             uint32_t packet = readOffset / kPacketBits;
             if (packet >= count)
             {
-                // Buffer finished: mark it invalid and continue with the other one.
+                // Buffer finished: hand it back and continue with the other one (same stream).
                 d[0] = SetBits(d[0], validBit, 1, 0);
                 current ^= 1;
                 d[4] = SetBits(d[4], 31, 1, current);
                 d[2] = SetBits(d[2], 0, 26, 32);
-                h.inputPtr = current ? d[6] : d[5];
                 h.expectedReadOffset = 32;
                 h.switches++;
                 changed = true;
-                avcodec_flush_buffers(h.codec);
                 continue;
             }
             DecodePacket(h, GuestPtr(0xA0000000u | ((current ? d[6] : d[5]) + packet * kPacketBytes)));
@@ -195,17 +213,24 @@ namespace
             h.expectedReadOffset = next;
             changed = true;
         }
+        h.lastWrite = write;
         if (!changed) return;
-        // Write back only the fields the decoder owns (the title writes the rest concurrently).
-        uint32_t d0 = Load32(addr), d2 = Load32(addr + 8), d4 = Load32(addr + 16);
-        d0 = SetBits(d0, 27, 5, write);
-        d0 = SetBits(d0, 20, 1, Bits(d[0], 20, 1) & Bits(d0, 20, 1));
-        d0 = SetBits(d0, 21, 1, Bits(d[0], 21, 1) & Bits(d0, 21, 1));
-        d2 = SetBits(d2, 0, 26, Bits(d[2], 0, 26));
-        d4 = SetBits(d4, 31, 1, Bits(d[4], 31, 1));
-        Store32(addr, d0);
-        Store32(addr + 8, d2);
-        Store32(addr + 16, d4);
+
+        // Write back only what the decoder changed, and only where the title hasn't written since
+        // the context was read (it refills buffers and resets offsets from its own threads).
+        uint32_t c0 = Load32(addr), c2 = Load32(addr + 8), c4 = Load32(addr + 16);
+        uint32_t c5 = Load32(addr + 20), c6 = Load32(addr + 24);
+        if (Bits(c0, 27, 5) == Bits(o[0], 27, 5)) c0 = SetBits(c0, 27, 5, write);
+        else h.lastWrite = Bits(c0, 27, 5);
+        // Clear a finished buffer's valid bit unless the title has already refilled it.
+        if (Bits(o[0], 20, 1) && !Bits(d[0], 20, 1) && c5 == o[5]) c0 = SetBits(c0, 20, 1, 0);
+        if (Bits(o[0], 21, 1) && !Bits(d[0], 21, 1) && c6 == o[6]) c0 = SetBits(c0, 21, 1, 0);
+        if (Bits(c2, 0, 26) == Bits(o[2], 0, 26)) c2 = SetBits(c2, 0, 26, Bits(d[2], 0, 26));
+        else h.expectedReadOffset = 0xFFFFFFFF;   // the title moved it meanwhile: follow it next tick
+        if (Bits(c4, 31, 1) == Bits(o[4], 31, 1)) c4 = SetBits(c4, 31, 1, Bits(d[4], 31, 1));
+        Store32(addr, c0);
+        Store32(addr + 8, c2);
+        Store32(addr + 16, c4);
     }
 #endif
 }
@@ -227,8 +252,9 @@ void XmaTick(const std::vector<uint32_t>& contexts)
         nextLog += std::chrono::seconds(10);
         for (auto& [c, h] : g_host)
             if (h->packets)
-                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, decoded peak %.3f, %u buffer switches", c, h->rate, h->channels,
-                    (unsigned long long)h->packets, h->peak, h->switches), h->peak = 0;
+                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, loop count %u start %u end %u",
+                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens,
+                    h->lastLoop[0], h->lastLoop[1], h->lastLoop[2]), h->peak = 0;
     }
     // Forget decoders of released contexts.
     for (auto it = g_host.begin(); it != g_host.end();)
