@@ -20,6 +20,7 @@
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 #ifdef PEGGLE2_HAVE_FFMPEG
@@ -42,6 +43,72 @@ namespace
     }
 
 #ifdef PEGGLE2_HAVE_FFMPEG
+    // ---- XMA2 frame map --------------------------------------------------------------------
+    // A buffer is a run of 2 KB packets. Packet header (32 bits, big-endian): frame count:6 @26
+    // (frames starting in this packet), first frame offset:15 @11 (bits after the header),
+    // metadata:3 @8, packet skip:8. Frames are packed back to back across packets (headers
+    // skipped); each starts with a 15-bit length in bits (0x7FFF = padding to the next packet)
+    // and decodes to 512 samples per channel. Positions are buffer bit offsets including the
+    // headers - the coordinates of the context's read offset and loop points.
+    constexpr uint32_t kSamplesPerFrame = 512;
+    struct FrameMap
+    {
+        uint32_t ptr = 0, count = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> frames;   // [start, end)
+        std::vector<uint32_t> firstStart;                     // per packet, ~0u = no frame starts
+        std::vector<uint16_t> endingIn;                       // per packet: frames ending in it
+        uint32_t resyncs = 0;
+    };
+
+    uint32_t Advance(uint32_t b, uint32_t n)
+    {
+        while (n)
+        {
+            uint32_t end = (b / kPacketBits + 1) * kPacketBits;
+            if (b + n < end) return b + n;
+            n -= end - b;
+            b = end + 32;   // skip the next packet's header
+        }
+        return b;
+    }
+
+    void BuildFrameMap(FrameMap& m, uint32_t ptr, uint32_t count)
+    {
+        m = FrameMap{};
+        m.ptr = ptr;
+        m.count = count;
+        const uint8_t* buf = GuestPtr(0xA0000000u | ptr);
+        uint32_t total = count * kPacketBits;
+        m.firstStart.assign(count, ~0u);
+        m.endingIn.assign(count, 0);
+        for (uint32_t p = 0; p < count; p++)
+        {
+            uint32_t h = (uint32_t(buf[p * kPacketBytes]) << 24) | (buf[p * kPacketBytes + 1] << 16) | (buf[p * kPacketBytes + 2] << 8) | buf[p * kPacketBytes + 3];
+            if (h >> 26) m.firstStart[p] = p * kPacketBits + 32 + ((h >> 11) & 0x7FFF);
+        }
+        auto bit = [&](uint32_t b) { return (buf[b >> 3] >> (7 - (b & 7))) & 1; };
+        auto nextFirst = [&](uint32_t fromPacket) {
+            for (uint32_t p = fromPacket; p < count; p++) if (m.firstStart[p] != ~0u) return m.firstStart[p];
+            return total;
+        };
+        uint32_t cur = nextFirst(0);
+        while (cur + 15 < total)
+        {
+            uint32_t len = 0, b = cur;
+            for (int i = 0; i < 15 && b < total; i++) { len = (len << 1) | bit(b); b = Advance(b, 1); }
+            if (len == 0x7FFF || len < 15) { cur = nextFirst(cur / kPacketBits + 1); continue; }   // padding
+            uint32_t end = Advance(cur, len);
+            if (end > total) break;
+            m.frames.push_back({ cur, end });
+            uint32_t ep = (end - 1) / kPacketBits;
+            if (ep < count) m.endingIn[ep]++;
+            // A frame ending in a later packet: the next frame must be where that packet's header says.
+            uint32_t sp = cur / kPacketBits;
+            cur = end;
+            if (ep > sp && ep < count && m.firstStart[ep] != ~0u && cur != m.firstStart[ep]) { m.resyncs++; cur = m.firstStart[ep]; }
+        }
+    }
+
     struct HostContext
     {
         AVCodecContext* codec = nullptr;
@@ -57,6 +124,15 @@ namespace
         uint32_t lastWrite = 0xFFFFFFFF;             // output write offset we last left
         bool ended = false;                          // input ran out (next valid input = new sound)
         uint32_t lastLoop[3] = {};                   // loop count, start, end seen (debugging)
+        // Frame-accurate position since the decoder (re)started at startBit: samples to drop
+        // (frames ahead of startBit in its packet), samples decoded since.
+        FrameMap map;
+        bool needBegin = true;
+        uint32_t startBit = 0;
+        uint32_t feedBit = 0;      // next packet to feed the decoder (internal)
+        uint64_t skip = 0, sinceStart = 0;
+        uint32_t checkMismatches = 0, checkedPackets = 0;
+        bool loopLogged = false;
         ~HostContext()
         {
             av_frame_free(&frame);
@@ -103,18 +179,27 @@ namespace
     }
 
     // Decode one 2 KB packet into h.pending (16-bit big-endian, interleaved).
-    void DecodePacket(HostContext& h, const uint8_t* data)
+    void DecodePacket(HostContext& h, const uint8_t* data, uint32_t packetIndex)
     {
-        h.packetData.assign(data, data + kPacketBytes);
-        h.packetData.resize(kPacketBytes + AV_INPUT_BUFFER_PADDING_SIZE, 0);
-        h.packet->data = h.packetData.data();
-        h.packet->size = int(kPacketBytes);
-        if (avcodec_send_packet(h.codec, h.packet) < 0) return;
+        uint64_t decoded = 0;
+        if (data)
+        {
+            h.packetData.assign(data, data + kPacketBytes);
+            h.packetData.resize(kPacketBytes + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+            h.packet->data = h.packetData.data();
+            h.packet->size = int(kPacketBytes);
+            if (avcodec_send_packet(h.codec, h.packet) < 0) return;
+        }
+        else if (avcodec_send_packet(h.codec, nullptr) < 0) return;   // drain
         while (avcodec_receive_frame(h.codec, h.frame) == 0)
         {
             int n = h.frame->nb_samples, ch = std::min<int>(h.frame->ch_layout.nb_channels, int(h.channels));
             bool planar = av_sample_fmt_is_planar(AVSampleFormat(h.frame->format));
+            decoded += uint64_t(n);
             for (int i = 0; i < n; i++)
+            {
+                if (h.skip) { h.skip--; continue; }   // frames before the start position
+                h.sinceStart++;
                 for (int c = 0; c < int(h.channels); c++)
                 {
                     float v = 0;
@@ -127,6 +212,22 @@ namespace
                     h.pending.push_back(uint8_t(uint16_t(s) >> 8));
                     h.pending.push_back(uint8_t(s));
                 }
+            }
+        }
+        // Self-check: the frame map and the decoder must agree on the frames ending here
+        // (frame-accurate loops depend on it). Packets right after a (re)start are skipped.
+        if (!data) return;
+        if (packetIndex < h.map.endingIn.size() && !h.needBegin)
+        {
+            h.checkedPackets++;
+            if (decoded != uint64_t(h.map.endingIn[packetIndex]) * kSamplesPerFrame)
+            {
+                h.checkMismatches++;
+                static int logged = 0;
+                if (logged++ < 10)
+                    Log("[xma] frame map check: packet %u decoded %llu samples, map says %u frames", packetIndex,
+                        (unsigned long long)decoded, h.map.endingIn[packetIndex]);
+            }
         }
         h.packets++;
         g_totalPackets++;
@@ -138,6 +239,23 @@ namespace
     {
         avcodec_flush_buffers(h.codec);
         h.pending.clear();
+        h.needBegin = true;
+    }
+
+    // (Re)start position R: the decoder resumes at the first frame starting in R's packet, so
+    // drop the frames between that and R.
+    void BeginAt(HostContext& h, uint32_t r)
+    {
+        h.startBit = r;
+        h.feedBit = r;
+        h.sinceStart = 0;
+        h.skip = 0;
+        h.needBegin = false;
+        uint32_t p = r / kPacketBits;
+        if (p >= h.map.firstStart.size()) return;
+        uint32_t first = h.map.firstStart[p];
+        for (auto& [fs, fe] : h.map.frames)
+            if (fs >= first && fs < r) h.skip += kSamplesPerFrame;
     }
 
     void ProcessContext(uint32_t addr, HostContext& h)
@@ -155,6 +273,7 @@ namespace
         {
             if (!OpenDecoder(h, rate, channels)) return;
             h.reopens++;
+            h.needBegin = true;
             h.expectedReadOffset = 0xFFFFFFFF;
             h.lastWrite = 0xFFFFFFFF;
         }
@@ -194,35 +313,85 @@ namespace
                 h.seeks++;
                 Restart(h);       // the title moved the read position
             }
-            uint32_t packet = readOffset / kPacketBits;
+            uint32_t inPtr = current ? d[6] : d[5];
+            if (h.map.ptr != inPtr || h.map.count != count) BuildFrameMap(h.map, inPtr, count);
+            if (h.needBegin) BeginAt(h, readOffset);
+            uint32_t packet = h.feedBit / kPacketBits;
             if (packet >= count)
             {
-                // Buffer finished: hand it back and continue with the other one (same stream).
+                // Buffer finished: hand it back and continue with the other one (same stream:
+                // the decoder carries on, positions restart at the new buffer's start).
                 d[0] = SetBits(d[0], validBit, 1, 0);
                 current ^= 1;
                 d[4] = SetBits(d[4], 31, 1, current);
                 d[2] = SetBits(d[2], 0, 26, 32);
                 h.expectedReadOffset = 32;
                 h.switches++;
+                h.startBit = 0;
+                h.feedBit = 32;
+                h.sinceStart = 0;
                 changed = true;
                 continue;
             }
-            DecodePacket(h, GuestPtr(0xA0000000u | ((current ? d[6] : d[5]) + packet * kPacketBytes)));
-            uint32_t next = (packet + 1) * kPacketBits + 32;   // past the next packet's header
-            // Hardware loop: loop count (d0 bits 12-19, 255 = forever), loop start/end (d3/d4,
-            // bit offsets in the input). After the packet holding the loop end, continue at the
-            // loop start (packet granularity: the loop end is normally the end of the data).
+            DecodePacket(h, GuestPtr(0xA0000000u | (inPtr + packet * kPacketBytes)), packet);
+            h.feedBit = (packet + 1) * kPacketBits + 32;
+            // Read offset as the hardware reports it: the next frame to be decoded, i.e. the first
+            // frame starting in the next packet to feed (frame-accurate, ahead of the output, like
+            // Xenia). Reporting the output's position instead (behind the input) crashed the
+            // sound engine at the main menu.
+            uint32_t nextPacket = h.feedBit / kPacketBits;
+            uint32_t next = nextPacket < count && h.map.firstStart[nextPacket] != ~0u ? h.map.firstStart[nextPacket] : h.feedBit;
+            // Hardware loop: loop count (d0 bits 12-19, 255 = forever), loop start/end (d3/d4).
+            // Frame-accurate: once the frames from startBit up to the loop end have been decoded,
+            // cut the output exactly there and continue at the loop start. (Playing past the loop
+            // end desynchronised the sound engine and crashed it at the main menu.)
             uint32_t loops = Bits(d[0], 12, 8), loopStart = Bits(d[3], 0, 26), loopEnd = Bits(d[4], 0, 26);
-            // Disabled: at packet granularity the frames after the loop end are played too, the
-            // sound engine's position tracking drifts and it crashes at the main menu (null
-            // entry at 0x825A5D38). Needs frame-accurate loop ends; until then, play through.
-            constexpr bool kHardwareLoops = false;
-            if (kHardwareLoops && loops && loopEnd > loopStart && packet >= loopEnd / kPacketBits)
+            if (loops && loopEnd > loopStart && h.startBit < loopEnd)
             {
-                next = loopStart;
-                if (loops != 255) d[0] = SetBits(d[0], 12, 8, loops - 1);
-                avcodec_flush_buffers(h.codec);   // bitstream discontinuity; queued output is kept
-                h.loopsTaken++;
+                uint64_t target = 0;
+                uint32_t lastPacket = 0;
+                for (auto& [fs, fe] : h.map.frames)
+                    if (fs >= h.startBit && fe <= loopEnd) { target += kSamplesPerFrame; lastPacket = std::max(lastPacket, (fe - 1) / kPacketBits); }
+                // The decoder holds back the last samples it decoded: once the packet with the
+                // loop's last frame is in, drain it so the whole loop has come out.
+                if (target && h.sinceStart < target && packet >= lastPacket)
+                {
+                    DecodePacket(h, nullptr, packet);
+                    if (h.sinceStart < target)
+                    {
+                        static int logged = 0;
+                        if (logged++ < 5) Log("[xma] loop short: %llu of %llu samples after draining", (unsigned long long)h.sinceStart, (unsigned long long)target);
+                        h.sinceStart = target;   // jump anyway
+                    }
+                }
+                if (!h.loopLogged)   // debugging: one line per looping sound
+                {
+                    h.loopLogged = true;
+                    Log("[xma] loop: %u packets, loop %u..%u, start %u, %zu frames mapped, target %llu samples, feeding packet %u, output %llu",
+                        count, loopStart, loopEnd, h.startBit, h.map.frames.size(), (unsigned long long)target, packet, (unsigned long long)h.sinceStart);
+                }
+                if (target && h.sinceStart >= target)
+                {
+                    uint64_t excess = h.sinceStart - target;
+                    size_t bytes = size_t(excess) * h.channels * 2;
+                    if (bytes <= h.pending.size())
+                        h.pending.resize(h.pending.size() - bytes);
+                    else
+                    {
+                        static int logged = 0;
+                        if (logged++ < 5) Log("[xma] loop end overshoot already written (%llu samples)", (unsigned long long)excess);
+                        h.pending.clear();
+                    }
+                    if (loops != 255) d[0] = SetBits(d[0], 12, 8, loops - 1);
+                    avcodec_flush_buffers(h.codec);   // bitstream discontinuity; queued output is kept
+                    BeginAt(h, loopStart);
+                    next = loopStart;
+                    static int loggedJumps = 0;
+                    if (loggedJumps++ < 20)
+                        Log("[xma] loop taken: %llu samples per pass (%u frames), %llu excess trimmed, %u loops left",
+                            (unsigned long long)target, uint32_t(target / kSamplesPerFrame), (unsigned long long)excess, loops == 255 ? 255u : loops - 1);
+                    h.loopsTaken++;
+                }
             }
             d[2] = SetBits(d[2], 0, 26, next);
             h.expectedReadOffset = next;
@@ -268,8 +437,8 @@ void XmaTick(const std::vector<uint32_t>& contexts)
         nextLog += std::chrono::seconds(10);
         for (auto& [c, h] : g_host)
             if (h->packets)
-                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, loop count %u start %u end %u",
-                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken,
+                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, map check %u/%u bad, loop count %u start %u end %u",
+                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken, h->checkMismatches, h->checkedPackets,
                     h->lastLoop[0], h->lastLoop[1], h->lastLoop[2]), h->peak = 0;
     }
     // Forget decoders of released contexts.
