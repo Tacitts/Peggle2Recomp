@@ -156,9 +156,21 @@ namespace
         out.push_back(std::move(vs));
     }
 
-    // Texture snapshots (see TextureSnapshot): reused while 64 sampled 16-byte spots of the
-    // footprint are unchanged, copied again otherwise. GPU thread only.
-    struct SnapshotEntry { uint64_t sample = 0; std::shared_ptr<const TextureSnapshot> snap; };
+    // Texture snapshots (see TextureSnapshot). A texture whose memory changed recently (movie
+    // planes, render-to-texture copies) is "dynamic": copied in full every frame it is drawn.
+    // Others are reused while 64 sampled 16-byte spots are unchanged: sampling alone misses
+    // small changes in mostly flat images (a movie's chroma planes), which showed stale colour.
+    // GPU thread only.
+    struct SnapshotEntry
+    {
+        uint64_t sample = 0;
+        std::shared_ptr<const TextureSnapshot> snap;
+        uint64_t dynamicUntil = 0;     // GPU frame until which the texture counts as dynamic
+        uint64_t copiedFrame = ~0ull;  // GPU frame of the last copy
+        uint64_t hashFrame = ~0ull;    // GPU frame of the last full hash
+    };
+    uint64_t g_gpuFrame = 0;           // swap markers seen
+    constexpr uint64_t kDynamicFrames = 300;
     std::unordered_map<uint64_t, SnapshotEntry> g_snapshots;   // (address, size) -> latest copy
 
     std::shared_ptr<const TextureSnapshot> SnapshotTexture(const uint32_t* f)
@@ -177,15 +189,38 @@ namespace
         if (!GuestTextureFootprint(t, bytes) || !bytes) return nullptr;
         if (uint64_t(t.address) + bytes > 0xC0000000ull) bytes = 0xC0000000u - t.address;
         const uint8_t* p = GuestPtr(t.address);
-        uint64_t h = 1469598103934665603ull;
-        for (uint64_t i = 0; i < 64; i++)
-        {
-            uint64_t at = bytes > 16 ? (uint64_t(bytes) - 16) * i / 63 : 0;
-            for (int k = 0; k < 16 && at + k < bytes; k++) { h ^= p[at + k]; h *= 1099511628211ull; }
-        }
         auto& e = g_snapshots[(uint64_t(t.address) << 32) | bytes];
-        if (!e.snap || e.sample != h)
+        // Change detection: textures up to 4 MB are hashed in full (once per frame); larger ones
+        // (atlases) by 64 sampled 16-byte spots.
+        uint64_t h = 1469598103934665603ull;
+        if (bytes <= (4u << 20))
         {
+            if (e.hashFrame == g_gpuFrame && e.snap) return e.snap;   // already checked this frame
+            e.hashFrame = g_gpuFrame;
+            size_t words = bytes / 8;
+            for (size_t i = 0; i < words; i++)
+            {
+                uint64_t v;
+                memcpy(&v, p + i * 8, 8);
+                h = (h ^ v) * 0x100000001B3ull;
+                h ^= h >> 29;
+            }
+            for (size_t i = words * 8; i < bytes; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        }
+        else
+        {
+            for (uint64_t i = 0; i < 64; i++)
+            {
+                uint64_t at = bytes > 16 ? (uint64_t(bytes) - 16) * i / 63 : 0;
+                for (int k = 0; k < 16 && at + k < bytes; k++) { h ^= p[at + k]; h *= 1099511628211ull; }
+            }
+        }
+        bool changed = e.snap && e.sample != h;
+        if (changed) e.dynamicUntil = g_gpuFrame + kDynamicFrames;
+        bool dynamicRefresh = g_gpuFrame <= e.dynamicUntil && e.copiedFrame != g_gpuFrame;
+        if (!e.snap || changed || dynamicRefresh)
+        {
+            e.copiedFrame = g_gpuFrame;
             auto snap = std::make_shared<TextureSnapshot>();
             snap->address = t.address;
             snap->data.assign(p, p + bytes);
@@ -635,6 +670,7 @@ namespace
             // VdSwap's NOP carries a marker: the frame's draws are complete.
             if (count >= 2 && r.Read() == kSwapMarker)
             {
+                g_gpuFrame++;
                 uint32_t frontBuffer = r.Read();   // physical address VdSwap displays
                 RendererSubmitDraws(std::move(g_frameDrawList), frontBuffer);
                 g_frameDrawList = {};
