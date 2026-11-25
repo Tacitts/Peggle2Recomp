@@ -241,7 +241,51 @@ int main(int argc, char** argv)
                 fallthroughInRange = true;
                 def = 0;
             }
-            if (!cmpK || !brK || maxIdx > 4096) { rejectedNoCmp++; continue; }
+            if (!cmpK || !brK || maxIdx > 4096)
+            {
+                // Unguarded table stored inline right after the bctr, e.g. 0x821C7328:
+                //   lis r12,hi ; rlwinm r0,r3,2,0,29 ; addi r12,r12,lo ; lwzx r0,r12,r0 ; mtctr r0 ; bctr
+                //   .long case0, case1, ...      (cases start right where the table ends)
+                // No bounds check: the size is where the first case begins. The switch register
+                // is the rlwinm's source (the unscaled index).
+                int idx = -1;
+                for (size_t k = mt; k-- > 0 && mt - k <= 8;)
+                {
+                    Insn i = at(k);
+                    if (IsBranch(i)) break;
+                    if (i.op() == 21 && ((i.raw >> 11) & 31) == 2 && ((i.raw >> 6) & 31) == 0 && ((i.raw >> 1) & 31) == 29)
+                    {
+                        idx = int((i.raw >> 21) & 31);
+                        break;
+                    }
+                }
+                Table t{};
+                if (idx >= 0 && b + 1 < n)
+                {
+                    uint32_t tableStart = addr(b + 1), firstCase = UINT32_MAX;
+                    for (size_t k = b + 1; k < n && k - b <= 512; k++)
+                    {
+                        uint32_t v = BE32(d + k * 4);
+                        if (addr(k) >= firstCase) break;   // reached the case code
+                        if ((v & 3) || v <= tableStart || v >= sec.base + sec.size || v - addr(b) > 0x2000) break;
+                        t.labels.push_back(v);
+                        firstCase = std::min(firstCase, v);
+                    }
+                    bool exact = !t.labels.empty() && firstCase == tableStart + 4 * uint32_t(t.labels.size());
+                    if (exact && t.labels.size() >= 2)
+                    {
+                        t.base = addr(b);
+                        t.bctr = addr(b);
+                        t.r = uint32_t(idx);
+                        t.def = 0;
+                        printf("  inline table at bctr 0x%X: %zu cases (switch on r%d)\n", t.bctr, t.labels.size(), idx);
+                        tables.push_back(std::move(t));
+                        continue;
+                    }
+                }
+                rejectedNoCmp++;
+                continue;
+            }
             if (fallthroughInRange) windowStart = *brK + 1;
 
             // Pre-context: decodable instructions before the cmplwi (hoisted lis etc.).

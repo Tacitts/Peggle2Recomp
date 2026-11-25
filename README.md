@@ -110,7 +110,11 @@ cmd /c "tools\build.cmd tools build\tools"
   `lis/rlwinm/addi`. `tools/jumptables` instead finds `cmplwi crN,rI,N` + `bgt/ble crN`
   ahead of each `mtctr/bctr` and interprets the code between them for every index.
   Kinds seen: absolute word tables, `lhzx` short-offset, `lbzx` byte-offset, and
-  `lbzx`+shift computed tables. The other 609 `bctr`s are virtual/indirect calls.
+  `lbzx`+shift computed tables. One table has no bounds check at all (0x821C7328, 28 cases):
+  the table sits right after the `bctr` and its size is where the first case begins; the
+  detector handles that shape too. Missing it crashed the game at the end of the first
+  level (indirect call to 0x821C73B0, not a function start). The other `bctr`s (~594) are
+  virtual/indirect calls.
 - **Exception records.** 8-byte `{handler, data}` pairs precede functions flagged in
   `.pdata`: handler `0x825F2878` (2,137 functions) and `0x8288447C` (74 functions).
   Without skipping them, XenonRecomp's linear sweep analyses them as code and emits
