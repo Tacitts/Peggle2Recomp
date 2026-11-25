@@ -99,6 +99,9 @@ struct GuestTextureInfo
     bool tiled = false;
 };
 
+// Save a shader container found at a guest address (gpu.cpp). Returns false if it isn't one.
+bool SaveShaderContainer(uint32_t addr, const char* source);
+
 // Host renderer (render.cpp): window + D3D12 swap chain; RendererPresent() once per VdSwap.
 // `preview` (may be null) is the frame's largest bound texture, shown until draws are
 // translated.

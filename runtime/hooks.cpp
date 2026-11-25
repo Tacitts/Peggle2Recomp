@@ -22,6 +22,29 @@
             a3, a4, a5, a6, ctx.r3.u32);                                                      \
     }
 
+// Shader capture: functions that check the container magic 0x102A11xx (found with
+// tools/analysis/find_lis.py). Before each runs, any pointer argument that points at a
+// container is saved to build/runtime/shaders/.
+#define CAPTURE_SHADER_ARGS(addr)                                                             \
+    PPC_FUNC_IMPL(__imp__sub_##addr);                                                         \
+    PPC_FUNC(sub_##addr)                                                                      \
+    {                                                                                         \
+        SaveShaderContainer(ctx.r3.u32, "sub_" #addr " r3") ||                                \
+        SaveShaderContainer(ctx.r4.u32, "sub_" #addr " r4") ||                                \
+        SaveShaderContainer(ctx.r5.u32, "sub_" #addr " r5") ||                                \
+        SaveShaderContainer(ctx.r6.u32, "sub_" #addr " r6");                                  \
+        __imp__sub_##addr(ctx, base);                                                         \
+    }
+
+CAPTURE_SHADER_ARGS(82615118)
+CAPTURE_SHADER_ARGS(82635B48)
+CAPTURE_SHADER_ARGS(82636C60)
+CAPTURE_SHADER_ARGS(82660780)
+CAPTURE_SHADER_ARGS(82673CB0)
+CAPTURE_SHADER_ARGS(826F2AE8)
+CAPTURE_SHADER_ARGS(8272EB90)
+CAPTURE_SHADER_ARGS(827CBBC0)
+
 // The game's format-into-string helper (r3 = destination std::string, r4 = format, r5.. = args).
 // Calls whose format is a printable string in the image are mirrored into our log as [game]
 // lines (this is how "Startup failed. Reason=10" was found).

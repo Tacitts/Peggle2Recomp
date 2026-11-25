@@ -573,6 +573,41 @@ IMPORT(VdGetSystemCommandBuffer)
 #include <windows.h>
 #include <set>
 
+// Save one shader container (header at guest `addr`) if it looks valid and is new.
+// Returns true if it was a container. Used by the shader-creation hooks (hooks.cpp).
+bool SaveShaderContainer(uint32_t addr, const char* source)
+{
+    static std::mutex lock;
+    static std::set<uint64_t> saved;
+    auto committed = [](uint32_t a, uint32_t n) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(GuestPtr(a), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        return uint64_t(a) + n <= uint64_t(GuestAddr(mbi.BaseAddress)) + mbi.RegionSize;
+    };
+    if (!addr || !committed(addr, 0x24)) return false;
+    uint32_t flags = Load32(addr);
+    if ((flags & 0xFFFFFF00) != 0x102A1100 || Load32(addr + 0x1C) || Load32(addr + 0x20)) return false;
+    uint32_t size = Load32(addr + 4) + Load32(addr + 8);
+    if (!Load32(addr + 4) || size > 0x40000 || !committed(addr, size)) return false;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* bytes = GuestPtr(addr);
+    for (uint32_t i = 0; i < size; i++) { h ^= bytes[i]; h *= 1099511628211ull; }
+    std::lock_guard<std::mutex> g(lock);
+    if (!saved.insert(h).second) return true;
+    char exe[MAX_PATH];
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    auto dir = std::filesystem::path(exe).parent_path() / "shaders";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char name[32];
+    snprintf(name, sizeof(name), "%016llX.bin", (unsigned long long)h);
+    if (FILE* f = fopen((dir / name).string().c_str(), "wb")) { fwrite(bytes, 1, size, f); fclose(f); }
+    if (saved.size() <= 3 || saved.size() % 25 == 0)
+        Log("[gpu] shader container #%zu captured from %s (%s shader, %u bytes)", saved.size(), source,
+            (flags & 0xFF) == 1 ? "pixel" : "vertex", size);
+    return true;
+}
+
 static void DumpShaderContainers()
 {
     char exe[MAX_PATH];
