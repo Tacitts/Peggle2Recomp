@@ -602,9 +602,8 @@ bool SaveShaderContainer(uint32_t addr, const char* source)
     char name[32];
     snprintf(name, sizeof(name), "%016llX.bin", (unsigned long long)h);
     if (FILE* f = fopen((dir / name).string().c_str(), "wb")) { fwrite(bytes, 1, size, f); fclose(f); }
-    if (saved.size() <= 3 || saved.size() % 25 == 0)
-        Log("[gpu] shader container #%zu captured from %s (%s shader, %u bytes)", saved.size(), source,
-            (flags & 0xFF) == 1 ? "pixel" : "vertex", size);
+    Log("[gpu] shader container #%zu %s captured from %s (%s shader, %u bytes)", saved.size(), name, source,
+        (flags & 0x1) == 0 ? "pixel" : "vertex", size);
     return true;
 }
 
@@ -612,7 +611,10 @@ static void DumpShaderContainers()
 {
     char exe[MAX_PATH];
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    auto dir = std::filesystem::path(exe).parent_path() / "shaders";
+    // Separate from shaders/: a header found by scanning may outlive its microcode (the
+    // physical part is copied to GPU memory and the source buffer reused), which decodes as
+    // garbage. Only the creation hooks (SaveShaderContainer) feed the conversion.
+    auto dir = std::filesystem::path(exe).parent_path() / "shaders_scan";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
 
