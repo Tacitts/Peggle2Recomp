@@ -124,6 +124,7 @@ namespace
         uint32_t lastWrite = 0xFFFFFFFF;             // output write offset we last left
         bool loggedBadOffset = false;                // diagnostic: out-of-range ring offsets seen
         uint32_t outputRevoked = 0;                  // output buffer invalidated by the title mid-tick
+        uint32_t finished = 0;                       // times the voice finished (output valid cleared)
         bool ended = false;                          // input ran out (next valid input = new sound)
         uint32_t lastLoop[3] = {};                   // loop count, start, end seen (debugging)
         // Frame-accurate position since the decoder (re)started at startBit: samples to drop
@@ -326,6 +327,15 @@ namespace
             if (!Bits(d[0], validBit, 1))
             {
                 h.ended = true;   // starved or finished: the next valid input starts fresh
+                // Out of input with part of a block left: pad it with silence and write it, as the
+                // hardware flushes its last block. Otherwise a sound's final samples (less than a
+                // 256-byte block) were never written, the title never saw the voice drain, and
+                // finished voices were never freed (see finishIfDone below).
+                if (!h.pending.empty() && h.pending.size() < kBlockBytes)
+                {
+                    h.pending.resize(kBlockBytes, 0);
+                    continue;   // written at the top of the loop (a block is free)
+                }
                 break;
             }
             uint32_t count = current ? Bits(d[1], 0, 12) : Bits(d[0], 0, 12);
@@ -421,7 +431,23 @@ namespace
         }
         h.lastWrite = write;
         if (h.outputRevoked != revokedBefore) { Restart(h); return; }   // title took the buffer away: write nothing back
-        if (!changed) return;
+
+        // A finished voice: both input buffers consumed, nothing left to write, and the title has
+        // read every block (read offset == write offset). The hardware then stops and clears the
+        // output buffer's valid bit, and that is how the title's sound engine learns the voice is
+        // done. Without it every sound effect looked like it was still playing: its voices were
+        // never freed (live contexts climbed to ~150-170 in a level) and once the pool was used up
+        // new sound effects stopped playing while the music went on. Checked against live memory,
+        // so a context the title has just refilled is left alone.
+        auto finishIfDone = [&] {
+            if (!h.ended || !h.pending.empty()) return;
+            uint32_t c0 = Load32(addr), c1 = Load32(addr + 4), c9 = Load32(addr + 36);
+            if (!Bits(c1, 31, 1) || Bits(c0, 20, 1) || Bits(c0, 21, 1)) return;   // already stopped, or refilled
+            if (Bits(c0, 27, 5) != Bits(c9, 0, 5)) return;                          // the title is still reading
+            Store32(addr + 4, SetBits(c1, 31, 1, 0));
+            h.finished++;
+        };
+        if (!changed) { finishIfDone(); return; }
 
         // Write back only what the decoder changed, and only where the title hasn't written since
         // the context was read (it refills buffers and resets offsets from its own threads).
@@ -439,6 +465,7 @@ namespace
         Store32(addr, c0);
         Store32(addr + 8, c2);
         Store32(addr + 16, c4);
+        finishIfDone();
     }
 #endif
 }
@@ -474,9 +501,32 @@ void XmaTick()
         nextLog += std::chrono::seconds(10);
         for (auto& [c, h] : g_host)
             if (h->packets)
-                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, %u revoked, map check %u/%u bad, loop count %u start %u end %u",
-                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken, h->outputRevoked, h->checkMismatches, h->checkedPackets,
+                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, %u revoked, %u finished, map check %u/%u bad, loop count %u start %u end %u",
+                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken, h->outputRevoked, h->finished, h->checkMismatches, h->checkedPackets,
                     h->lastLoop[0], h->lastLoop[1], h->lastLoop[2]), h->peak = 0;
+        // Voice states (finished-voice diagnosis): output valid / inputs valid / drained, and the
+        // decoder's own view, with raw dwords for a few contexts that look idle but still "playing".
+        uint32_t outOff = 0, playing = 0, idleValid = 0, idleNotDrained = 0, idleNotEnded = 0, idlePending = 0;
+        int shown = 0;
+        for (uint32_t c : contexts)
+        {
+            uint32_t d0 = Load32(c), d1 = Load32(c + 4), d9 = Load32(c + 36);
+            if (!Bits(d1, 31, 1)) { outOff++; continue; }
+            if (Bits(d0, 20, 1) || Bits(d0, 21, 1)) { playing++; continue; }
+            idleValid++;
+            auto it = g_host.find(c);
+            bool drained = Bits(d0, 27, 5) == Bits(d9, 0, 5);
+            if (!drained) idleNotDrained++;
+            if (it != g_host.end() && !it->second->ended) idleNotEnded++;
+            if (it != g_host.end() && !it->second->pending.empty()) idlePending++;
+            if (contexts.size() > 80 && shown++ < 3)   // only when voices pile up again
+                Log("[xma] idle-but-valid ctx %08X: %08X %08X %08X %08X %08X in0 %08X in1 %08X out %08X d8 %08X d9 %08X (host: %s, %zu pending bytes, %llu packets)",
+                    c, d0, d1, Load32(c + 8), Load32(c + 12), Load32(c + 16), Load32(c + 20), Load32(c + 24), Load32(c + 28), Load32(c + 32), d9,
+                    it == g_host.end() ? "none" : it->second->ended ? "ended" : "not ended", it == g_host.end() ? size_t(0) : it->second->pending.size(),
+                    it == g_host.end() ? 0ull : (unsigned long long)it->second->packets);
+        }
+        Log("[xma] voices: %zu live, %u output off, %u with input, %u idle with output on (%u not drained, %u decoder not ended, %u with pending output)",
+            contexts.size(), outOff, playing, idleValid, idleNotDrained, idleNotEnded, idlePending);
     }
     // Forget decoders of released contexts.
     for (auto it = g_host.begin(); it != g_host.end();)

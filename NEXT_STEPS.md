@@ -116,6 +116,19 @@ State at this commit, for whoever continues:
   The owner wanted it to resemble the South Park Tenorman's Revenge recomp's launcher; that
   launcher could not be viewed this session (screen access needs it in the Start menu, and a
   "South Park TR" Start-menu shortcut now exists for a later session).
+- **Sound effects dying in long sessions (fixed 2026-11-26).** Reported by the owner after
+  ~20 minutes of play: music went on, sound effects stopped. Cause: finished XMA voices never
+  looked finished. Our decoder only writes whole 256-byte output blocks, so a sound's last partial
+  block (typically 128 bytes) stayed pending forever; the ring never drained and the output buffer
+  stayed "valid", so the title's sound engine never freed the voice. Live contexts climbed to
+  ~160 in a level (the pool) and then new effects could not start. Fix (xma.cpp): when the input
+  runs out, pad the last partial block with silence and write it (as the hardware flushes), and
+  once the title has read everything, clear the output buffer's valid bit (d1 bit 31) like the
+  hardware does when it stops. 3-minute level runs now hold 18-33 live voices with steady decoding
+  to the end. `[xma] voices` lines every 10 s summarise voice states.
+- **Native zlib on by default (2026-11-26):** with reliable measurements it cut loading stutter
+  (frames shown late 601 -> 406 ms per load run, frames over 100 ms 5.7 -> 3.3);
+  `PEGGLE2_NATIVE_ZLIB=0` uses the title's own.
 - **Crash reporting was broken (fixed):** the log-buffering change left `CrashHandler` returning
   before its report, and floating-point traps were never reported. Both fixed; the handler masks
   FP exceptions before formatting its report.

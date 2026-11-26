@@ -5,10 +5,10 @@
 // 0x8248A988, so that one function is replaced: each guest z_stream gets a host z_stream that
 // does the work directly on guest memory, and the guest struct's public fields are updated.
 // The guest's own zlib state is never advanced, which is fine because nothing but inflate()
-// reads it. Opt-in with PEGGLE2_NATIVE_ZLIB=1: works (streams decode, no errors), but in a
-// first A/B on this machine it did not reduce loading spikes (85 slow frames with the title's
-// zlib, 110 with native, one 60 s menu run each), and the spike profile showed render-thread
-// driver waits and texture copies rather than inflate during those frames.
+// reads it. On by default (PEGGLE2_NATIVE_ZLIB=0 uses the title's own). A first A/B with a
+// noisy CPU-side metric showed no gain; with the loading benchmark (tools/bench_load.ps1, 3 runs
+// each, after the render-side upload fixes) it is clear: frames shown late 601 -> 406 ms per run,
+// frames over 100 ms 5.7 -> 3.3, worst 245 -> 207 ms. Streams decode without errors.
 //
 // Guest z_stream (zlib 1.1.3, 32-bit, big-endian): +0 next_in, +4 avail_in, +8 total_in,
 // +12 next_out, +16 avail_out, +20 total_out, +24 msg, +28 state, ..., +48 adler.
@@ -40,8 +40,8 @@ namespace
     {
         static const bool on = [] {
             const char* v = getenv("PEGGLE2_NATIVE_ZLIB");
-            bool enabled = v && v[0] == '1';
-            Log("[zlib] native inflate %s (zlib %s; PEGGLE2_NATIVE_ZLIB=1 to enable)", enabled ? "enabled" : "disabled", zlibVersion());
+            bool enabled = !(v && v[0] == '0');   // on by default
+            Log("[zlib] native inflate %s (zlib %s; PEGGLE2_NATIVE_ZLIB=0 uses the title's own)", enabled ? "enabled" : "disabled", zlibVersion());
             return enabled;
         }();
         return on;
