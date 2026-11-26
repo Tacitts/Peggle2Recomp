@@ -952,6 +952,10 @@ bool RunLauncher(const LauncherInfo& info)
                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g_wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    // Black title bar with white text (Windows 11; older Windows keeps the dark-mode bar).
+    COLORREF caption = RGB(0, 0, 0), captionText = RGB(255, 255, 255);
+    DwmSetWindowAttribute(g_wnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    DwmSetWindowAttribute(g_wnd, 36 /* DWMWA_TEXT_COLOR */, &captionText, sizeof(captionText));
     LoadArt();
 
     // Sidebar: pages, then Play and Quit at the bottom.

@@ -8,6 +8,8 @@
 #include "runtime.h"
 #include "frame_stats.h"
 #include "settings.h"
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 #include "achievements.h"
 
 #include <algorithm>
@@ -553,6 +555,14 @@ namespace
         g_hwnd = CreateWindowW(wc.lpszClassName, L"Peggle 2", WS_OVERLAPPEDWINDOW | (g_captureTitle ? 0 : WS_VISIBLE),
                                x, y, ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd) { Log("[render] CreateWindow failed (%lu)", GetLastError()); return false; }
+        {
+            // Black title bar with white text, like the launcher (Windows 11; dark mode elsewhere).
+            BOOL dark = TRUE;
+            COLORREF caption = RGB(0, 0, 0), captionText = RGB(255, 255, 255);
+            DwmSetWindowAttribute(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+            DwmSetWindowAttribute(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+            DwmSetWindowAttribute(g_hwnd, 36 /* DWMWA_TEXT_COLOR */, &captionText, sizeof(captionText));
+        }
         g_showFps = set.fpsCounter && !g_captureTitle;
         g_showPerf = set.perfOverlay && !g_captureTitle;
 
