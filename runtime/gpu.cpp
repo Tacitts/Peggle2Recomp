@@ -239,7 +239,11 @@ namespace
                 for (size_t off = 0; off < bytes && !changedDuringCopy; off += 4096)
                     changedDuringCopy = memcmp(snap->data.data() + off, p + off, std::min<size_t>(4096, bytes - off)) != 0;
                 if (!changedDuringCopy) break;
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                // Wait 0.5 ms by spinning: a sleep this short lasts a whole timer tick on
+                // Windows (up to 15.6 ms), which made these frames miss their vblank.
+                for (auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(500);
+                     std::chrono::steady_clock::now() < until;)
+                    std::this_thread::yield();
                 snap->data.assign(p, p + bytes);
             }
             if (changedDuringCopy && e.snap)
@@ -976,7 +980,9 @@ IMPORT(VdSwap)
         Log("[gpu] VdSwap #%u: %u draws this frame (%llu total); main texture %ux%u fmt %u endian %u %s at 0x%08X",
             n, frameDraws, (unsigned long long)g_draws.load(), best.width, best.height, best.format, best.endian,
             best.tiled ? "tiled" : "linear", best.address);
-    if (n == 300 || n == 1200) DumpShaderContainers();   // after loading screens have run
+    // Old shader-capture aid (a memory scan that stalls ~0.3 s): only with PEGGLE2_SHADER_SCAN.
+    static const bool shaderScan = getenv("PEGGLE2_SHADER_SCAN") != nullptr;
+    if (shaderScan && (n == 300 || n == 1200)) DumpShaderContainers();   // after loading screens have run
     if (n == 600) DumpPacketStats();
     if (n == 600 || n == 3000) DumpDrawKinds();
     ctx.r3.u64 = 0;
