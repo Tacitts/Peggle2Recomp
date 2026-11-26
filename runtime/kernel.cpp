@@ -14,6 +14,10 @@
 #define NOMINMAX
 #include <windows.h>
 
+// Allocation logging is chatty while loading (about 1,800 lines per level load): log the first
+// 40 calls of each kind, then every 500th.
+#define LogSome() ([] { static std::atomic<uint32_t> n{ 0 }; uint32_t k = n++; return k < 40 || k % 500 == 0; }())
+
 // ---- Watchdog ------------------------------------------------------------------------------
 struct GuestThreadInfo
 {
@@ -317,13 +321,13 @@ IMPORT(NtAllocateVirtualMemory)
         CommitGuest(start, end - start);
         Store32(basePtr, start);
         Store32(sizePtr, end - start);
-        Log("[mem] NtAllocateVirtualMemory commit 0x%08X size 0x%X (type 0x%X)", start, end - start, type);
+        if (LogSome()) Log("[mem] NtAllocateVirtualMemory commit 0x%08X size 0x%X (type 0x%X)", start, end - start, type);
         ctx.r3.u64 = STATUS_SUCCESS;
         return;
     }
     uint32_t aligned = (size + 0xFFFF) & ~0xFFFFu;
     uint32_t a = AllocVirtual(aligned, 0x10000);
-    Log("[mem] NtAllocateVirtualMemory(want 0x%08X, size 0x%X, type 0x%X, protect 0x%X) -> 0x%08X", want, size, type, ctx.r6.u32, a);
+    if (LogSome()) Log("[mem] NtAllocateVirtualMemory(want 0x%08X, size 0x%X, type 0x%X, protect 0x%X) -> 0x%08X", want, size, type, ctx.r6.u32, a);
     if (!a) { ctx.r3.u64 = STATUS_NO_MEMORY; return; }
     // Reserve without commit leaves the pages uncommitted, as on hardware (the title's heap
     // commits pieces explicitly and inspects commit state with NtQueryVirtualMemory).
@@ -346,7 +350,7 @@ IMPORT(NtFreeVirtualMemory)
     uint32_t start = addr & ~0xFFFu, end = (addr + size + 0xFFF) & ~0xFFFu;
     if ((type & 0xC000) && end > start)
         VirtualFree(GuestPtr(start), end - start, MEM_DECOMMIT);
-    Log("[mem] NtFreeVirtualMemory(0x%08X, size 0x%X, type 0x%X)", start, end - start, type);
+    if (LogSome()) Log("[mem] NtFreeVirtualMemory(0x%08X, size 0x%X, type 0x%X)", start, end - start, type);
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -356,7 +360,7 @@ IMPORT(MmAllocatePhysicalMemoryEx)
     uint32_t size = ctx.r4.u32, align = ctx.r8.u32;
     if (align < 0x1000) align = 0x1000;
     uint32_t a = AllocPhysical(size, align);
-    Log("[mem] MmAllocatePhysicalMemoryEx(flags 0x%X, size 0x%X, protect 0x%X, align 0x%X) -> 0x%08X", ctx.r3.u32, size, ctx.r5.u32, align, a);
+    if (LogSome()) Log("[mem] MmAllocatePhysicalMemoryEx(flags 0x%X, size 0x%X, protect 0x%X, align 0x%X) -> 0x%08X", ctx.r3.u32, size, ctx.r5.u32, align, a);
     ctx.r3.u64 = a;
 }
 IMPORT(MmFreePhysicalMemory) {}

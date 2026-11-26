@@ -7,6 +7,7 @@
 #include "runtime.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 
@@ -285,6 +286,20 @@ IMPORT(NtOpenFile)
     ctx.r3.u64 = OpenFile(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 1, "open");
 }
 
+// PEGGLE2_IO_LOG=1: one line per slow (>2 ms) write/flush and the first write to each file.
+static void IoTiming(const char* op, const FileObject& f, uint32_t bytes, std::chrono::steady_clock::time_point t0)
+{
+    static const bool on = getenv("PEGGLE2_IO_LOG") != nullptr;
+    if (!on) return;
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    static std::mutex m;
+    static std::unordered_map<std::string, uint32_t> seen;
+    std::lock_guard<std::mutex> g(m);
+    uint32_t& n = seen[f.guestPath + op];
+    if (ms > 2.0 || n++ == 0)
+        Log("[io] %s %s %u bytes: %.2f ms (call #%u)", op, f.guestPath.c_str(), bytes, ms, n);
+}
+
 // The kernel sets the caller's event when an I/O request completes, even one that completes
 // synchronously (as all of ours do). Callers that wait on it (Bink's movie reader) otherwise
 // sat out their wait timeout on every read.
@@ -374,7 +389,9 @@ IMPORT(NtWriteFile)
     ov.Offset = DWORD(offset);
     ov.OffsetHigh = DWORD(offset >> 32);
     DWORD wrote = 0;
+    auto t0 = std::chrono::steady_clock::now();
     BOOL ok = WriteFile(f->host, GuestPtr(buffer), length, &wrote, &ov);
+    IoTiming("write", *f, length, t0);
     f->position = offset + wrote;
     SetIosb(iosb, ok ? STATUS_SUCCESS : STATUS_ACCESS_DENIED, wrote);
     CompleteIo(ctx.r4.u32, ctx.r5.u32, "NtWriteFile");
@@ -383,7 +400,12 @@ IMPORT(NtWriteFile)
 
 IMPORT(NtFlushBuffersFile)
 {
-    if (auto f = LookupHandleAs<FileObject>(ctx.r3.u32); f && f->host != INVALID_HANDLE_VALUE) FlushFileBuffers(f->host);
+    if (auto f = LookupHandleAs<FileObject>(ctx.r3.u32); f && f->host != INVALID_HANDLE_VALUE)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        FlushFileBuffers(f->host);
+        IoTiming("flush", *f, 0, t0);
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 

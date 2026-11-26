@@ -16,7 +16,7 @@ struct FrameHist
     std::mutex lock;
     uint64_t counts[kBuckets] = {};
     uint64_t n = 0;
-    double maxMs = 0, sumMs = 0;
+    double maxMs = 0, sumMs = 0, lateMs = 0;   // lateMs: time past 34.5 ms, summed over late frames
 
     void Add(double ms)
     {
@@ -26,6 +26,7 @@ struct FrameHist
         counts[b]++;
         n++;
         sumMs += ms;
+        if (ms > kEdges[1]) lateMs += ms - kEdges[1];
         maxMs = std::max(maxMs, ms);
     }
 
@@ -34,8 +35,8 @@ struct FrameHist
     {
         std::lock_guard<std::mutex> g(lock);
         char buf[512];
-        int len = snprintf(buf, sizeof(buf), "%s: %llu, avg %.1f ms, max %.1f ms, over 34 ms: %llu |", name,
-                           (unsigned long long)n, n ? sumMs / n : 0.0, maxMs,
+        int len = snprintf(buf, sizeof(buf), "%s: %llu, avg %.1f ms, max %.1f ms, late by %.0f ms in total, over 34 ms: %llu |", name,
+                           (unsigned long long)n, n ? sumMs / n : 0.0, maxMs, lateMs,
                            (unsigned long long)(n - counts[0] - counts[1]));
         static const char* labels[] = { "<=17", "<=34", "<=50", "<=67", "<=100", "<=250", ">250" };
         for (int b = 0; b < kBuckets && len < int(sizeof(buf)) - 32; b++)
@@ -45,7 +46,7 @@ struct FrameHist
     }
 
     FrameHist() = default;
-    FrameHist& operator=(const FrameHist&) { for (auto& c : counts) c = 0; n = 0; maxMs = sumMs = 0; return *this; }
+    FrameHist& operator=(const FrameHist&) { for (auto& c : counts) c = 0; n = 0; maxMs = sumMs = lateMs = 0; return *this; }
 };
 
 extern FrameHist g_swapHist;      // guest VdSwap to VdSwap (the game's own frame time)

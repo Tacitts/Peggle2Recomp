@@ -19,6 +19,7 @@
 #include <tlhelp32.h>
 #include <timeapi.h>
 #include <thread>
+#include <xmmintrin.h>
 #include <unordered_map>
 
 PPC_EXTERN_FUNC(_xstart);
@@ -36,10 +37,27 @@ void Log(const char* fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    // Buffered: flushing every line (twice) on the calling thread blocked game threads while
+    // loading. LogFlushThread flushes every 100 ms; crashes flush at once (CrashHandler).
     std::lock_guard<std::mutex> g(g_logLock);
     fprintf(stdout, "%s\n", buf);
+    if (g_logFile) fprintf(g_logFile, "%s\n", buf);
+}
+
+void LogFlush()
+{
+    std::lock_guard<std::mutex> g(g_logLock);
     fflush(stdout);
-    if (g_logFile) { fprintf(g_logFile, "%s\n", buf); fflush(g_logFile); }
+    if (g_logFile) fflush(g_logFile);
+}
+
+static void LogFlushThread()
+{
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        LogFlush();
+    }
 }
 
 void CallGuest(PPCContext& ctx, uint32_t guestFunc)
@@ -234,11 +252,22 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep)
         ep->ContextRecord->Dr6 = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    // Ignore debugger/C++ exceptions; only report real faults.
-    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && rec->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION &&
-        rec->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && rec->ExceptionCode != EXCEPTION_BREAKPOINT &&
-        rec->ExceptionCode != EXCEPTION_STACK_OVERFLOW)
+    // Ignore debugger/C++ exceptions; only report real faults (floating-point traps included).
+    const DWORD code = rec->ExceptionCode;
+    const bool fp = code == EXCEPTION_FLT_INEXACT_RESULT || code == EXCEPTION_FLT_INVALID_OPERATION ||
+                    code == EXCEPTION_FLT_DIVIDE_BY_ZERO || code == EXCEPTION_FLT_OVERFLOW ||
+                    code == EXCEPTION_FLT_UNDERFLOW || code == EXCEPTION_FLT_DENORMAL_OPERAND ||
+                    code == STATUS_FLOAT_MULTIPLE_TRAPS || code == STATUS_FLOAT_MULTIPLE_FAULTS;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_BREAKPOINT &&
+        code != EXCEPTION_STACK_OVERFLOW && !fp)
+    {
+        LogFlush();
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // The report formats numbers: mask FP exceptions first so it can't trap again itself.
+    _mm_setcsr(_mm_getcsr() | 0x1F80);
+    if (fp) Log("==== floating-point trap: MXCSR at the fault 0x%08X", ep->ContextRecord->MxCsr);
 
     uintptr_t rip = (uintptr_t)rec->ExceptionAddress;
     Log("==== CRASH: code 0x%08lX at host %p (inside guest function ~0x%08X)", rec->ExceptionCode, (void*)rip, GuestFuncForHost(rip));
@@ -258,14 +287,21 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep)
     LogGuestChain(*ep->ContextRecord);
     if (g_logFile) fflush(g_logFile);
     TerminateProcess(GetCurrentProcess(), 3);
+    LogFlush();
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // Installed in every function-table slot that has no recompiled function.
 static void MissingFunctionTrap(PPCContext& ctx, uint8_t* base)
 {
+#ifdef PPC_CONFIG_CTR_AS_LOCAL
+    // CTR lives in the calling function's locals: the target isn't recorded in the context.
+    Log("==== indirect call to an address that is not a recompiled function start (lr 0x%08llX)",
+        (unsigned long long)ctx.lr);
+#else
     Log("==== indirect call to guest 0x%08X, which is not a recompiled function start (lr 0x%08llX)",
         ctx.ctr.u32, (unsigned long long)ctx.lr);
+#endif
     Log("     add it as a function in config/peggle2.base.toml if it is real code");
     __debugbreak(); // reported by CrashHandler with the guest call chain
 }
@@ -451,8 +487,14 @@ static void ProfilerThread(double startSeconds, double seconds)
 // was busy in it, the functions its samples fell in.
 namespace
 {
-    struct SpikeSample { int64_t qpc; DWORD tid; uint64_t rip; };
+    // stack: 1 + sequence number of its g_stackRing entry (0 = none); game threads get a call stack per sample
+    // so a slow frame can be broken down inclusively (which caller the time was spent under).
+    struct SpikeSample { int64_t qpc; DWORD tid; uint64_t rip; uint64_t stack; };
     constexpr size_t kSpikeRing = 1 << 20;
+    constexpr size_t kStackDepth = 20, kStackRing = 1 << 17;
+    struct SpikeStack { uint64_t rip[kStackDepth]; uint32_t n; };
+    std::vector<SpikeStack> g_stackRing;
+    uint64_t g_stackPos = 0;
     std::vector<SpikeSample> g_spikeRing;
     std::atomic<uint64_t> g_spikePos{ 0 };
     std::atomic<bool> g_spikeMode{ false };
@@ -471,6 +513,7 @@ static void SpikeProfilerThread()
 {
     NameHostThread("profiler");
     g_spikeRing.resize(kSpikeRing);
+    g_stackRing.resize(kStackRing);
     g_spikeMode = true;
     std::unordered_map<DWORD, ProfThread> threads;
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
@@ -537,7 +580,8 @@ static void SpikeProfilerThread()
 
     timeBeginPeriod(1);
     Log("[profile] spike mode: game frames over 40 ms are broken down per thread");
-    std::vector<std::pair<DWORD, uint64_t>> got;
+    struct Got { DWORD id; uint64_t rip; uint64_t stack; };
+    std::vector<Got> got;
     got.reserve(256);
     for (uint64_t round = 0;; round++)
     {
@@ -545,16 +589,37 @@ static void SpikeProfilerThread()
         got.clear();
         for (auto& [id, t] : threads)
         {
+            // Game threads (guest threads and the unnamed main thread) get a call stack.
+            bool wantStack = t.name.rfind("guest", 0) == 0 || t.name.rfind("host ", 0) == 0;
             if (SuspendThread(t.h) == DWORD(-1)) continue;
             CONTEXT c{};
-            c.ContextFlags = CONTEXT_CONTROL;
+            c.ContextFlags = wantStack ? (CONTEXT_CONTROL | CONTEXT_INTEGER) : CONTEXT_CONTROL;
             BOOL ok = GetThreadContext(t.h, &c);
+            uint64_t rip = c.Rip;
+            uint64_t stack = 0;
+            if (ok && wantStack)
+            {
+                // Only lock-free unwinding while the thread is suspended (as SampleThreadStack).
+                SpikeStack& st = g_stackRing[g_stackPos % kStackRing];
+                st.n = 0;
+                for (; st.n < kStackDepth && c.Rip; st.n++)
+                {
+                    st.rip[st.n] = st.n ? c.Rip - 1 : c.Rip;
+                    DWORD64 imageBase;
+                    auto* fe = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+                    if (!fe) { st.n++; break; }
+                    void* handlerData;
+                    DWORD64 establisher;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fe, &c, &handlerData, &establisher, nullptr);
+                }
+                stack = ++g_stackPos;   // 1 + the entry's sequence number
+            }
             ResumeThread(t.h);
-            if (ok) got.push_back({ id, c.Rip });
+            if (ok) got.push_back({ id, rip, stack });
         }
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        for (auto& [id, rip] : got) g_spikeRing[g_spikePos++ % kSpikeRing] = { now.QuadPart, id, rip };
+        for (auto& g : got) g_spikeRing[g_spikePos++ % kSpikeRing] = { now.QuadPart, g.id, g.rip, g.stack };
 
         // Reports whose frame ended at least 5 ms ago.
         std::vector<std::pair<int64_t, int64_t>> due;
@@ -566,7 +631,7 @@ static void SpikeProfilerThread()
         }
         for (auto [a, b] : due)
         {
-            std::unordered_map<DWORD, std::unordered_map<std::string, uint32_t>> byThread;
+            std::unordered_map<DWORD, std::unordered_map<std::string, uint32_t>> byThread, inclusive;
             std::unordered_map<DWORD, uint32_t> total;
             uint64_t end = g_spikePos.load();
             for (uint64_t k = end > kSpikeRing ? end - kSpikeRing : 0; k < end; k++)
@@ -575,7 +640,23 @@ static void SpikeProfilerThread()
                 if (s.qpc < a || s.qpc > b) continue;
                 total[s.tid]++;
                 const std::string& n = symName(s.rip);
-                if (!isWait(n)) byThread[s.tid][n]++;
+                if (isWait(n)) continue;
+                byThread[s.tid][n]++;
+                // Inclusive: every guest function on the stack, once per sample. (A stack slot
+                // overwritten since is skipped: the ring holds the last 131,072 stacks.)
+                if (s.stack && g_stackPos - (s.stack - 1) <= kStackRing)
+                {
+                    const SpikeStack& st = g_stackRing[(s.stack - 1) % kStackRing];
+                    std::vector<const std::string*> seen;
+                    for (uint32_t i = 0; i < st.n; i++)
+                    {
+                        const std::string& f = symName(st.rip[i]);
+                        if (f.find("__imp__sub_") == std::string::npos) continue;   // guest functions only
+                        if (std::find(seen.begin(), seen.end(), &f) != seen.end()) continue;
+                        seen.push_back(&f);
+                        inclusive[s.tid][f]++;
+                    }
+                }
             }
             Log("[spike] game frame took %.1f ms", double(b - a) * 1000.0 / f.QuadPart);
             for (auto& [tid, funcs] : byThread)
@@ -595,6 +676,21 @@ static void SpikeProfilerThread()
                 }
                 auto it = threads.find(tid);
                 Log("[spike]   %-24s busy %u/%u samples: %s", it != threads.end() ? it->second.name.c_str() : "?", busy, total[tid], line.c_str());
+                if (auto inc = inclusive.find(tid); inc != inclusive.end() && busy * 2 >= total[tid])
+                {
+                    std::vector<std::pair<uint32_t, std::string>> topInc;
+                    for (auto& [n, c] : inc->second) topInc.push_back({ c, n });
+                    std::sort(topInc.rbegin(), topInc.rend());
+                    std::string incLine;
+                    for (size_t i = 0; i < topInc.size() && i < 14; i++)
+                    {
+                        char buf[300];
+                        std::string n = topInc[i].second.substr(topInc[i].second.find("__imp__sub_") + 11);
+                        snprintf(buf, sizeof(buf), "%s%u %s", i ? ", " : "", topInc[i].first, n.c_str());
+                        incLine += buf;
+                    }
+                    Log("[spike]     inclusive (samples under each guest function): %s", incLine.c_str());
+                }
             }
         }
         Sleep(1);
@@ -608,6 +704,10 @@ int main(int argc, char** argv)
     timeBeginPeriod(1);
     RotateLogs();
     g_logFile = fopen("peggle2_runtime.log", "w");
+    if (g_logFile) setvbuf(g_logFile, nullptr, _IOFBF, 1 << 16);
+    setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
+    std::thread(LogFlushThread).detach();
+    atexit(LogFlush);
     AddVectoredExceptionHandler(1, CrashHandler);
 
     g_gameDir = FindGameDir(argc, argv);

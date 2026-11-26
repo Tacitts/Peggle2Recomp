@@ -20,3 +20,4 @@
 .vscode/
 *.user
 Thumbs.db
+ppc_*/

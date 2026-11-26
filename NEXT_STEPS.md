@@ -59,13 +59,38 @@ State at this commit, for whoever continues:
   routines (`memset`, string functions), and find what the 830-instruction `0x82404ED8` does.
 - `NtReadFile`/`NtReadFileScatter`/`NtWriteFile` now signal the caller's completion event, as
   the kernel does for a request that completes synchronously (nothing in the intro used one).
+- **Loading hitches, round 2.** Benchmark: `tools/bench_load.ps1 -Runs 4` (boot, walk into a
+  level with A presses, 45 s; sums how far past 34.5 ms each game frame and each shown frame
+  ran, from the `[frames]` lines). Typical: game frames late by about 3,000 ms per run, shown
+  frames by 420-580 ms. Where the shown lateness is, per 10 s window: intro movie about 250 ms
+  (70-80 frames at 50 ms), menus about 115 ms (about 44 frames at 50 ms; the menu background is a
+  movie too), level load about 70-110 ms (one 67-100 ms frame and a few at 50 ms), play about 13 ms.
+  So what is visible is mostly the movie cadence; the 100-160 ms loading frames are mostly hidden
+  by the presenter. Tried, no measurable change, reverted:
+  - XenonRecomp `ctr/xer/reserved/cr_as_local` (variant A): 2,988 vs about 3,000 ms. With
+    `tools/regen_variant.ps1 -Name X -Options a,b` (keeps each variant in `ppc_X/`; it touches the
+    files so Ninja rebuilds them: mixing two variants' objects breaks the PPCContext layout and
+    crashed with unmasked FP exceptions).
+  - Audio tick phase-locked to the display vblank: the movie cadence stayed (72 and 44 frames at
+    50 ms in the intro and menu windows). The title flips on every second vblank from its own
+    vblank handler (`0x8261EF88`), so a movie frame whose work ends near that boundary waits a
+    vblank; that is guest logic. Next idea there: study `0x8261EF88`'s flip decision.
+  - Logging: allocation lines (about 1,800 per load, each flushed twice on the game thread) are now
+    rate-limited and the log is buffered (flushed every 100 ms and on a crash): small gain.
+  - The inclusive spike profile (call stacks per sample) shows the loading frames are the title's
+    loader (`0x8214F248`/`0x8241FBF0` -> `0x8238EE90`) and frame step, spread over hundreds of
+    functions, with zlib (`0x82500300`) on thread 11 at the same time.
+- **Crash reporting was broken (fixed):** the log-buffering change left `CrashHandler` returning
+  before its report, and floating-point traps were never reported. Both fixed; the handler masks
+  FP exceptions before formatting its report.
 - Tried and left off: XenonRecomp `cr/xer/reserved_as_local` (about 10% on loading frames) and
   `non_argument_as_local` (deadlocks at boot: threads stuck in RtlEnterCriticalSection; why is
   not understood and might point at a runtime bug worth a look).
 - Debug aids: `PEGGLE2_PROFILE=spikes` (per-thread breakdown of game frames over 40 ms),
   `PEGGLE2_PROFILE=<start>,<seconds>` (whole-run profile), `PEGGLE2_AUTOPRESS=A` (A only),
   `PEGGLE2_60FPS=1`, `PEGGLE2_GPU_STATS=1`, `PEGGLE2_SHADER_SCAN=1`, `PEGGLE2_NATIVE_ZLIB=1`,
-  `PEGGLE2_LATE_LOG=1`, `PEGGLE2_VBLANK=timer`,
+  `PEGGLE2_LATE_LOG=1`, `PEGGLE2_VBLANK=timer`, `PEGGLE2_IO_LOG=1` (slow writes/flushes),
+  `tools/bench_load.ps1`, `tools/regen_variant.ps1`,
   `tools/soak.ps1 -Runs N -Seconds S -AutoPress 1|A`.
 - This machine: vcpkg is at `C:\dev\vcpkg` (the repo path has a space); configure with
   `"-DPEGGLE2_FFMPEG_ROOT=C:/dev/vcpkg/installed/x64-windows-static"`. vcpkg's static zlib is

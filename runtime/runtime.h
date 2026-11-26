@@ -86,6 +86,7 @@ extern thread_local uint32_t t_kthread;          // guest KTHREAD of the current
 
 // ---- Logging -------------------------------------------------------------------------
 void Log(const char* fmt, ...);
+void LogFlush();                                   // write buffered log lines out now
 void NameHostThread(const char* fmt, ...);
 void ProfilerReportSpike(int64_t qpcStart, int64_t qpcEnd);   // PEGGLE2_PROFILE=spikes: a slow game frame   // thread description (debuggers, PEGGLE2_PROFILE)
 extern thread_local const char* g_lastImport;
