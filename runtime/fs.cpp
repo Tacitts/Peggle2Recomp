@@ -6,6 +6,7 @@
 // (No comment line may end in a backslash: it would continue onto the next line.)
 #include "runtime.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -284,6 +285,17 @@ IMPORT(NtOpenFile)
     ctx.r3.u64 = OpenFile(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 1, "open");
 }
 
+// The kernel sets the caller's event when an I/O request completes, even one that completes
+// synchronously (as all of ours do). Callers that wait on it (Bink's movie reader) otherwise
+// sat out their wait timeout on every read.
+static void CompleteIo(uint32_t event, uint32_t apc, const char* what)
+{
+    if (event) SignalHandle(event);
+    static std::atomic<uint32_t> loggedEvent{ 0 }, loggedApc{ 0 };
+    if (event && loggedEvent++ == 0) Log("[fs] %s with a completion event: signalling it", what);
+    if (apc && loggedApc++ == 0) Log("[fs] %s with a completion APC routine 0x%08X (not delivered)", what, apc);
+}
+
 // NtReadFile(handle, event, apcRoutine, apcContext, IO_STATUS_BLOCK*, buffer, length, u64* offset)
 IMPORT(NtReadFile)
 {
@@ -315,6 +327,7 @@ IMPORT(NtReadFile)
     f->position = offset + got;
     uint32_t status = (got == 0 && length != 0) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
     SetIosb(iosb, status, got);
+    CompleteIo(ctx.r4.u32, ctx.r5.u32, "NtReadFile");
     ctx.r3.u64 = status;
 }
 
@@ -341,6 +354,7 @@ IMPORT(NtReadFileScatter)
     }
     f->position = offset + total;
     SetIosb(iosb, STATUS_SUCCESS, total);
+    CompleteIo(ctx.r4.u32, ctx.r5.u32, "NtReadFileScatter");
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -363,6 +377,7 @@ IMPORT(NtWriteFile)
     BOOL ok = WriteFile(f->host, GuestPtr(buffer), length, &wrote, &ov);
     f->position = offset + wrote;
     SetIosb(iosb, ok ? STATUS_SUCCESS : STATUS_ACCESS_DENIED, wrote);
+    CompleteIo(ctx.r4.u32, ctx.r5.u32, "NtWriteFile");
     ctx.r3.u64 = ok ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
 }
 

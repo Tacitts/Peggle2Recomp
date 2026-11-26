@@ -10,6 +10,8 @@
 // (the physical allocator's range). Command buffers are big-endian dwords. Memory writes
 // carry an endian-swap mode in the low 2 address bits (0 none, 1 8in16, 2 8in32, 3 16in32).
 #include "runtime.h"
+#include "frame_stats.h"
+#include <windows.h>
 #include "xenos.h"
 
 #include <algorithm>
@@ -339,7 +341,13 @@ namespace
     std::atomic<uint64_t> g_vblanks{ 0 }, g_packets{ 0 }, g_fences{ 0 }, g_interrupts{ 0 };
     std::once_flag g_startOnce;
     PPCContext g_gpuCtx{};    // guest context of the GPU thread (for interrupt callbacks)
-    std::chrono::steady_clock::time_point g_nextVblank;
+    std::chrono::steady_clock::time_point g_nextVblank, g_lastVblank;
+    // Host display vblank (render.cpp's vblank thread): when the monitor runs at 60 Hz, the
+    // guest's vblank follows it, so each 30 fps game frame lines up with two monitor refreshes.
+    std::atomic<uint64_t> g_hostVblanks{ 0 };
+    std::atomic<bool> g_hostVblankMode{ false };
+    uint64_t g_hostVblanksSeen = 0;
+    HANDLE g_gpuWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // host vblank arrived
 
     uint32_t PhysToGuest(uint32_t phys) { return 0xA0000000u | (phys & 0x1FFFFFFFu); }
 
@@ -385,9 +393,25 @@ namespace
     // that a WAIT_REG_MEM on vblank-driven state can complete.
     void TickVblank()
     {
+        constexpr auto kPeriod = std::chrono::microseconds(16667);
         auto now = std::chrono::steady_clock::now();
-        if (now < g_nextVblank) return;
-        g_nextVblank = now + std::chrono::microseconds(16667);
+        if (g_hostVblankMode.load(std::memory_order_relaxed))
+        {
+            uint64_t h = g_hostVblanks.load(std::memory_order_acquire);
+            // Fire once per host vblank (never in bursts); if the host vblanks stop arriving
+            // (display off, thread stalled), fall back to the timer after three periods.
+            if (h == g_hostVblanksSeen && now - g_lastVblank < 3 * kPeriod) return;
+            g_hostVblanksSeen = h;
+            g_nextVblank = now + kPeriod;
+        }
+        else
+        {
+            if (now < g_nextVblank) return;
+            // Absolute schedule: lateness in noticing one vblank doesn't push the later ones back.
+            g_nextVblank += kPeriod;
+            if (now - g_nextVblank > 4 * kPeriod) g_nextVblank = now + kPeriod;   // after a long stall
+        }
+        g_lastVblank = now;
         uint64_t n = ++g_vblanks;
         CallInterrupt(0, 2);
         if (n == 1 || n == 60 || (n % 600) == 0)
@@ -755,7 +779,9 @@ namespace
                 if (g_rptrWriteBackPhys) Store32(PhysToGuest(g_rptrWriteBackPhys), g_readPtr);
             }
             TickVblank();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            // Idle: wake at once for a host vblank, otherwise poll the ring every ~1 ms
+            // (timeBeginPeriod(1) is set at startup).
+            WaitForSingleObject(g_gpuWake, 1);
         }
     }
 
@@ -763,6 +789,15 @@ namespace
 
     uint32_t* RegsPtr() { return g_regs; }
 }
+
+// Render thread's vblank thread: one call per host display vblank (60 Hz displays only).
+void GpuHostVblank()
+{
+    g_hostVblanks.fetch_add(1, std::memory_order_release);
+    g_hostVblankMode.store(true, std::memory_order_relaxed);
+    SetEvent(g_gpuWake);
+}
+void GpuHostVblankLost() { g_hostVblankMode.store(false, std::memory_order_relaxed); }
 
 // ---- Display queries ---------------------------------------------------------------------------
 // X_VIDEO_MODE: width, height, interlaced, widescreen, hi-def, f32 refresh, standard,
@@ -945,6 +980,8 @@ static void DumpShaderContainers()
     Log("[gpu] shader capture: %u containers in memory, %u unique written to %s", found, written, dir.string().c_str());
 }
 
+FrameHist g_swapHist;
+
 // VdSwap(u32* bufferPtr, fetch, ...): D3D reserves 64 dwords in the ring at bufferPtr for the
 // swap packet. Fill it with one NOP packet covering the space (no presentation yet).
 static std::atomic<uint32_t> g_swaps{ 0 };
@@ -956,6 +993,15 @@ IMPORT(VdSwap)
         QueryPerformanceCounter(&now);
         QueryPerformanceFrequency(&f);
         if (last.QuadPart && now.QuadPart - last.QuadPart > f.QuadPart / 25) ProfilerReportSpike(last.QuadPart, now.QuadPart);
+        if (last.QuadPart)
+        {
+            double ms = double(now.QuadPart - last.QuadPart) * 1000.0 / double(f.QuadPart);
+            g_swapHist.Add(ms);
+            static int lateLogged = 0;
+            static const bool lateLog = getenv("PEGGLE2_LATE_LOG") != nullptr;
+            if (lateLog && ms > 40 && g_swaps > 900 && lateLogged++ < 40)
+                Log("[late] game swap #%u came %.1f ms after the previous (vblanks %llu)", g_swaps.load() + 1, ms, (unsigned long long)g_vblanks.load());
+        }
         last = now;
     }
     if (uint32_t buf = ctx.r3.u32)

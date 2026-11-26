@@ -28,12 +28,44 @@ State at this commit, for whoever continues:
   `NtGdiDdDDIWaitForSynchronizationObjectFromCpu` (driver/fence waits), `std::vector::assign`
   and memcpy (texture copies), plus shader compiles; some spikes have very few samples, i.e. the
   whole process stalls. Next: look at render-side fence waits and per-frame texture uploads.
+- **Frame pacing (30 fps solid), 2026-11-25.** Measured with the new `[frames]` lines (every
+  10 s: game swap intervals, intervals between presents that showed a new frame, render-thread
+  time per present; `PEGGLE2_LATE_LOG=1` logs each late frame after swap 900). Before, in a
+  level, 22-34 of every 300 frames reached the screen after 50 ms instead of 33, and in the menus
+  30-60 presents per 10 s repeated an old frame while as many frames were never shown. Causes
+  and fixes:
+  1. The guest vblank was a free-running timer re-armed from "now" (drifted with every late
+     check) and not locked to the display. Now a `vblank` thread waits on the display's real
+     vblank (`IDXGIOutput::WaitForVBlank`) and the GPU thread fires the guest's vblank on it
+     (60 Hz displays only; otherwise, or with `PEGGLE2_VBLANK=timer`, an absolute-schedule
+     timer). The GPU thread's idle wait wakes on it instead of sleeping 200 us.
+  2. The render thread re-presented the last frame at 60 Hz; a new frame arriving during that
+     `Present()` waited an extra vblank. It now presents only new frames.
+  3. Presents were requested at `VdSwap`, which runs ahead of the GPU thread, so a present often
+     drew the previous draw list. Now the GPU thread requests the present when the frame's draws
+     are complete.
+  4. `timeBeginPeriod(1)` for the whole run (it was only set in profiling modes).
+  After: in a level 0-4 of 300 frames per 10 s are shown late (mostly 35-48 ms), with no
+  repeated or skipped frames.
+- **What is left:** (a) the intro and menu movies are Bink 2 at 60 fps, paced by the title on
+  the audio clock (6 audio frames of 256 samples = 32 ms per step vs 33.3 ms per flip), so about
+  every 0.8 s one movie frame waits an extra vblank. That is the title's own pacing (`0x82623150`
+  / `0x8261D378` spin on Bink's audio-frame counter), not a decoder speed problem; all decode
+  threads are idle. (b) Loading into a level: about 4 frames of 100-160 ms. The main thread is in
+  the title's loading code (`0x82422D50`, `0x82490740`, `0x82427508`, `0x82404ED8`) while
+  thread 11 inflates assets. The title's `memcpy` (`0x825F0AE0`, 1,083 call sites) is now a
+  native `memmove` (hooks.cpp); it was the hottest single function in those frames, but one A/B
+  showed only a small gain (118 vs 130 frames over 40 ms). Next ideas: replace other hot runtime
+  routines (`memset`, string functions), and find what the 830-instruction `0x82404ED8` does.
+- `NtReadFile`/`NtReadFileScatter`/`NtWriteFile` now signal the caller's completion event, as
+  the kernel does for a request that completes synchronously (nothing in the intro used one).
 - Tried and left off: XenonRecomp `cr/xer/reserved_as_local` (about 10% on loading frames) and
   `non_argument_as_local` (deadlocks at boot: threads stuck in RtlEnterCriticalSection; why is
   not understood and might point at a runtime bug worth a look).
 - Debug aids: `PEGGLE2_PROFILE=spikes` (per-thread breakdown of game frames over 40 ms),
   `PEGGLE2_PROFILE=<start>,<seconds>` (whole-run profile), `PEGGLE2_AUTOPRESS=A` (A only),
   `PEGGLE2_60FPS=1`, `PEGGLE2_GPU_STATS=1`, `PEGGLE2_SHADER_SCAN=1`, `PEGGLE2_NATIVE_ZLIB=1`,
+  `PEGGLE2_LATE_LOG=1`, `PEGGLE2_VBLANK=timer`,
   `tools/soak.ps1 -Runs N -Seconds S -AutoPress 1|A`.
 - This machine: vcpkg is at `C:\dev\vcpkg` (the repo path has a space); configure with
   `"-DPEGGLE2_FFMPEG_ROOT=C:/dev/vcpkg/installed/x64-windows-static"`. vcpkg's static zlib is

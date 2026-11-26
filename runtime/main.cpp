@@ -531,7 +531,8 @@ static void SpikeProfilerThread()
     };
     auto isWait = [](const std::string& n) {
         return n.find("ntdll!Zw") == 0 || n.find("ntdll!Nt") == 0 || n.find("SleepConditionVariable") != std::string::npos ||
-               n.find("RtlDelayExecution") != std::string::npos || n.find("SwitchToThread") != std::string::npos;
+               n.find("RtlDelayExecution") != std::string::npos || n.find("SwitchToThread") != std::string::npos ||
+               n.find("WaitForVerticalBlank") != std::string::npos;
     };
 
     timeBeginPeriod(1);
@@ -602,6 +603,9 @@ static void SpikeProfilerThread()
 
 int main(int argc, char** argv)
 {
+    // 1 ms timer resolution for the whole run: the GPU thread's idle wait, the audio tick and
+    // the guest's own Sleep()s otherwise last a 15.6 ms timer tick, which made frames late.
+    timeBeginPeriod(1);
     RotateLogs();
     g_logFile = fopen("peggle2_runtime.log", "w");
     AddVectoredExceptionHandler(1, CrashHandler);

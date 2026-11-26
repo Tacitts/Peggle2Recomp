@@ -6,6 +6,7 @@
 // copied into the back buffer. That makes movie frames, backgrounds and UI atlases visible.
 // The title shows game frames, FPS and the previewed texture.
 #include "runtime.h"
+#include "frame_stats.h"
 
 #include <algorithm>
 #include <chrono>
@@ -297,6 +298,11 @@ namespace
     std::mutex g_presentLock;
     std::condition_variable g_presentCv;
     uint64_t g_requested = 0, g_presented = 0;
+    // Frame pacing stats: each submitted draw list gets a serial; a present shows one serial.
+    uint64_t g_drawSerial = 0;          // under g_drawsLock
+    uint64_t g_shownSerial = 0;         // serial of the draw list the last PresentFrame drew
+    FrameHist g_newFrameHist;           // time between presents that showed a new draw list
+    FrameHist g_renderWorkHist;         // PresentFrame CPU time (includes the Present() wait)
     std::atomic<bool> g_ready{ false };
 
     // Texture preview: latest texture from the game, and one upload buffer per back buffer
@@ -638,6 +644,7 @@ namespace
             std::lock_guard<std::mutex> g(g_drawsLock);
             draws = g_latestDraws;
             front = g_latestFront;
+            g_shownSerial = g_drawSerial;
         }
         UINT pw = 0, ph = 0;
         if (draws.empty()) PreparePreview(i, preview, pw, ph);
@@ -750,13 +757,75 @@ namespace
         }
     }
 
+    // Host display vblank -> guest vblank (gpu.cpp), so the game's 30 fps (a flip every second
+    // vblank) is locked to the monitor's refresh instead of a free-running timer that drifts
+    // against it. Only for ~60 Hz displays (the guest expects 60 Hz vblanks); otherwise, or
+    // with PEGGLE2_VBLANK=timer, the guest keeps its own timer.
+    void VblankThread()
+    {
+        NameHostThread("vblank");
+        if (const char* v = getenv("PEGGLE2_VBLANK"); v && strcmp(v, "timer") == 0)
+        {
+            Log("[render] vblank: guest timer (PEGGLE2_VBLANK=timer)");
+            return;
+        }
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        IDXGIOutput* out = nullptr;
+        int recheck = 0, fast = 0;
+        int lastMode = -1;   // logged state: 0 timer, 1 host
+        auto last = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            if (!out || --recheck <= 0)
+            {
+                if (out) { out->Release(); out = nullptr; }
+                recheck = 300;   // re-pick the output every ~5 s (window moved, mode changed)
+                HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFOEXW mi{};
+                mi.cbSize = sizeof(mi);
+                DEVMODEW dm{};
+                dm.dmSize = sizeof(dm);
+                DWORD hz = GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ? dm.dmDisplayFrequency : 0;
+                bool sixty = hz >= 59 && hz <= 61;
+                if (sixty && FAILED(g_swapChain->GetContainingOutput(&out))) out = nullptr;
+                int mode = out ? 1 : 0;
+                if (mode != lastMode)
+                {
+                    Log("[render] vblank: %s (display %lu Hz)", mode ? "locked to the display" : "guest timer", (unsigned long)hz);
+                    lastMode = mode;
+                }
+                if (!out) { GpuHostVblankLost(); Sleep(500); recheck = 0; continue; }
+            }
+            if (FAILED(out->WaitForVBlank()))
+            {
+                out->Release();
+                out = nullptr;
+                GpuHostVblankLost();
+                Sleep(100);
+                continue;
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::milliseconds(8))   // not a real vblank wait (e.g. display asleep)
+            {
+                if (++fast > 30) { GpuHostVblankLost(); out->Release(); out = nullptr; fast = 0; lastMode = -1; Sleep(500); }
+                continue;
+            }
+            fast = 0;
+            last = now;
+            GpuHostVblank();
+        }
+    }
+
     void RenderThread()
     {
         NameHostThread("render");
         if (!CreateWindowAndDevice()) return;
         g_ready = true;
+        std::thread(VblankThread).detach();
         auto lastTitle = std::chrono::steady_clock::now();
         uint64_t lastFrames = 0;
+        uint64_t lastStatFrame = 0, lastSerial = 0, dupPresents = 0, skippedLists = 0;
+        std::chrono::steady_clock::time_point lastNew{}, lastStats = lastTitle;
         for (;;)
         {
             MSG msg;
@@ -770,14 +839,49 @@ namespace
             bool hasPreview;
             {
                 std::unique_lock<std::mutex> lk(g_presentLock);
-                g_presentCv.wait_for(lk, std::chrono::milliseconds(16), [] { return g_requested != g_presented; });
+                // Present only new frames: re-presenting the old one at 60 Hz made a frame that
+                // arrived during that Present() wait an extra vblank (50 ms instead of 33).
+                bool fresh = g_presentCv.wait_for(lk, std::chrono::milliseconds(50), [] { return g_requested != g_presented; });
+                if (!fresh && !g_resizePending) continue;   // keep pumping window messages
                 frame = g_requested;
                 g_presented = g_requested;
                 preview = g_pendingPreview;
                 hasPreview = g_hasPreview;
             }
+            auto workStart = std::chrono::steady_clock::now();
             PresentFrame(frame, hasPreview ? &preview : nullptr);
             auto now = std::chrono::steady_clock::now();
+            g_renderWorkHist.Add(std::chrono::duration<double, std::milli>(now - workStart).count());
+            if (frame != lastStatFrame)   // a present the game asked for
+            {
+                lastStatFrame = frame;
+                if (g_shownSerial == lastSerial) dupPresents++;
+                else
+                {
+                    if (lastSerial && g_shownSerial > lastSerial + 1) skippedLists += g_shownSerial - lastSerial - 1;
+                    double gap = lastNew.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(now - lastNew).count() : 0;
+                    if (gap) g_newFrameHist.Add(gap);
+                    static int lateLogged = 0;
+                    if (gap > 40 && frame > 900 && lateLogged < 40 && getenv("PEGGLE2_LATE_LOG"))
+                    {
+                        lateLogged++;
+                        Log("[late] frame %llu shown %.1f ms after the previous; this present's render work %.1f ms (draw list %llu)",
+                            (unsigned long long)frame, gap, std::chrono::duration<double, std::milli>(now - workStart).count(),
+                            (unsigned long long)g_shownSerial);
+                    }
+                    lastNew = now;
+                    lastSerial = g_shownSerial;
+                }
+            }
+            if (now - lastStats > std::chrono::seconds(10))
+            {
+                lastStats = now;
+                Log("[frames] %s", g_swapHist.TakeLine("game swaps").c_str());
+                Log("[frames] %s; %llu repeated a frame, %llu frames never shown", g_newFrameHist.TakeLine("new frames shown").c_str(),
+                    (unsigned long long)dupPresents, (unsigned long long)skippedLists);
+                Log("[frames] %s", g_renderWorkHist.TakeLine("render thread per present").c_str());
+                dupPresents = skippedLists = 0;
+            }
             if (now - lastTitle > std::chrono::seconds(1))
             {
                 double secs = std::chrono::duration<double>(now - lastTitle).count();
@@ -794,9 +898,20 @@ namespace
 
 void RendererSubmitDraws(DrawList&& draws, uint32_t frontBuffer)
 {
+    {
     std::lock_guard<std::mutex> g(g_drawsLock);
     g_latestDraws = std::move(draws);
     g_latestFront = frontBuffer;
+    g_drawSerial++;
+    }
+    // With draw translation, a frame is presented when its draws are complete (here, on the GPU
+    // thread), not at VdSwap, which runs ahead of the GPU thread and showed the old list again.
+    if (g_drawReady && !g_forcePreview)
+    {
+        std::lock_guard<std::mutex> lk(g_presentLock);
+        g_requested++;
+    }
+    g_presentCv.notify_one();
 }
 
 void StartRenderer()
@@ -810,8 +925,9 @@ void RendererPresent(const GuestTextureInfo* preview)
 {
     {
         std::lock_guard<std::mutex> lk(g_presentLock);
-        g_requested++;
         if (preview) { g_pendingPreview = *preview; g_hasPreview = true; }
+        if (g_drawReady && !g_forcePreview) return;   // presented from RendererSubmitDraws
+        g_requested++;
     }
     g_presentCv.notify_one();
 }

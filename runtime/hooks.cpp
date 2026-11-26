@@ -11,6 +11,7 @@
 // Note: a hooked function's original body (__imp__sub_X) may be attributed in call chains
 // to the guest function that precedes it, because the function table points at the hook.
 #include "runtime.h"
+#include <chrono>
 
 #define TRACE_FUNC(addr, label)                                                              \
     PPC_FUNC_IMPL(__imp__sub_##addr);                                                         \
@@ -109,4 +110,17 @@ PPC_FUNC(sub_8243CE30)
 {
     if (Sixty() && uint32_t(ctx.lr) == 0x8242FA34) return;   // its per-update tick
     __imp__sub_8243CE30(ctx, base);
+}
+
+// ---- Native memcpy ----------------------------------------------------------------------------
+// 0x825F0AE0 is the title's memcpy (r3 dest, r4 src, r5 length; returns dest): 290 PowerPC
+// instructions with 8/32-byte paths and dcbt hints, called from 1,083 places, and the hottest
+// function in loading spikes. Guest memory is one flat block, so a host copy does the same job.
+// memmove keeps overlapping copies well-defined (the title's routine copies forward in chunks).
+PPC_FUNC_IMPL(__imp__sub_825F0AE0);
+PPC_FUNC(sub_825F0AE0)
+{
+    uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, len = ctx.r5.u32;
+    if (len && dst != src) memmove(GuestPtr(dst), GuestPtr(src), len);
+    // r3 (the return value) is already the destination.
 }
