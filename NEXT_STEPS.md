@@ -13,14 +13,14 @@ State at this commit, for whoever continues:
   2 of 9 runs. So the fall-through fix did not cure it, and it only happens with XMA decoding.
   The XMA output-ring offsets were never out of range (diagnostic in `xma.cpp`), so it is not
   the decoder writing past its ring.
-- **Likely fix, needs more runs:** the audio tick snapshotted the live context list and then
+- **Fixed (b5cd74f):** the audio tick snapshotted the live context list and then
   decoded into the contexts' output rings without the lock `XMAReleaseContext` takes, so a
   context released (and its buffers freed by the title's sound heap) during a tick could still
   be written. Now `XMAReleaseContext` takes the decoder lock and the tick reads the live list
   under it; the decoder also re-checks output-valid/pointer/size before every block it writes
   (`revoked` in the 10 s `[xma] ctx` log lines; it was 0 in every run so far). After the change:
-  12 of 12 menu runs survived (expected about 3 crashes at the old rate; 0 of 12 has about a 5%
-  chance by luck). Run another 20-30 XMA-on runs, including level runs, before calling it fixed.
+  38 of 38 XMA-on runs survived: 32 x 60 s menu runs and 6 x 120 s level runs with
+  `PEGGLE2_AUTOPRESS=A` (at the old rate of about 2 in 9, 38 clean runs by luck is under 0.01%).
 - **Loading hitches: native zlib tried, no gain.** `runtime/zlib_native.cpp` replaces the
   title's `inflate()` (`0x8248A988`) with vcpkg's zlib on guest memory; it decodes correctly but
   one A/B in the menus gave 85 vs 110 slow frames (noise), so it is opt-in
