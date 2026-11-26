@@ -280,7 +280,41 @@ std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixe
         ShaderRecompiler recompiler;
         recompiler.recompile(container.data(), include);
         hlsl = AdjustHlsl(std::move(recompiler.out), pixel);
-        ok = CompileDxil(hlsl, pixel ? L"ps_6_0" : L"vs_6_0", t->dxil, errors);
+        // Compiled DXIL is cached on disk by a hash of the HLSL (any change in translation
+        // changes the HLSL, so a stale entry is never used): DXC takes 10-50 ms per shader,
+        // which showed as a hitch the first time each menu appeared.
+        uint64_t key = 1469598103934665603ull;
+        for (char ch : hlsl) { key ^= uint8_t(ch); key *= 1099511628211ull; }
+        key ^= pixel ? 0x9E3779B97F4A7C15ull : 0;
+        auto cacheDir = UserDataDir().parent_path() / "shadercache";
+        char cacheName[40];
+        snprintf(cacheName, sizeof(cacheName), "%016llX.dxil", (unsigned long long)key);
+        auto cachePath = cacheDir / cacheName;
+        if (FILE* f = fopen(cachePath.string().c_str(), "rb"))
+        {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) { t->dxil.resize(size_t(n)); ok = fread(t->dxil.data(), 1, size_t(n), f) == size_t(n); }
+            fclose(f);
+        }
+        if (!ok)
+        {
+            ok = CompileDxil(hlsl, pixel ? L"ps_6_0" : L"vs_6_0", t->dxil, errors);
+            if (ok)
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(cacheDir, ec);
+                auto tmp = cachePath; tmp += ".tmp";
+                if (FILE* f = fopen(tmp.string().c_str(), "wb"))
+                {
+                    bool written = fwrite(t->dxil.data(), 1, t->dxil.size(), f) == t->dxil.size();
+                    fclose(f);
+                    if (written) std::filesystem::rename(tmp, cachePath, ec);
+                    else std::filesystem::remove(tmp, ec);
+                }
+            }
+        }
     }
     else errors = "more than 16 vertex fetches";
 

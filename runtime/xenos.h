@@ -112,6 +112,11 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
 struct GuestTextureInfo;
 bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot = nullptr, size_t snapshotSize = 0);
 bool GuestTextureFootprint(const GuestTextureInfo& t, uint32_t& bytes);
+// DXT textures uploaded as they are (BC1/2/3): copies mip 0's blocks in row order into `dst`
+// (rows of `dstPitch` bytes), byte order fixed. False if the texture can't go this way
+// (not DXT, size not a multiple of 4, byte order 8in32/16in32, footprint not readable).
+bool CopyGuestDxtBlocks(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPitch, const uint8_t* snapshot, size_t snapshotSize);
+bool GuestDxtUploadable(const GuestTextureInfo& t, uint32_t& bytesPerBlock);
 
 // Texture memory copied when a draw is recorded (the title may overwrite it right after the
 // GPU signals the draw done, e.g. Bink's next movie frame). Shared between draws while the

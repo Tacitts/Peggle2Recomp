@@ -193,7 +193,7 @@ namespace
         return h;
     }
 
-    ID3D12Resource* CreateTexture(uint32_t w, uint32_t h)
+    ID3D12Resource* CreateTexture(uint32_t w, uint32_t h, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM)
     {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -203,7 +203,7 @@ namespace
         rd.Height = h;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.Format = format;
         rd.SampleDesc.Count = 1;
         ID3D12Resource* r = nullptr;
         if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r)))) return nullptr;
@@ -239,6 +239,35 @@ namespace
         src.pResource = up;
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, pitch };
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Barrier(list, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.release.push_back(up);
+        return tex;
+    }
+
+    // DXT texture uploaded as BC1/2/3 (no CPU decode, a quarter of the RGBA8 upload or less).
+    ID3D12Resource* UploadDxtTexture(ID3D12GraphicsCommandList* list, FrameResources& f, const GuestTextureInfo& t,
+                                     const uint8_t* snapshot, size_t snapshotSize)
+    {
+        uint32_t bpb;
+        if (!GuestDxtUploadable(t, bpb)) return nullptr;
+        DXGI_FORMAT fmt = bpb == 8 ? DXGI_FORMAT_BC1_UNORM : (t.format == 19 || t.format == 53) ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
+        uint32_t bw = t.width / 4, bh = t.height / 4;
+        uint32_t pitch = (bw * bpb + 255) & ~255u;
+        ID3D12Resource* up = CreateBuffer(uint64_t(pitch) * bh, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!up) return nullptr;
+        uint8_t* p = nullptr;
+        up->Map(0, nullptr, (void**)&p);
+        bool ok = CopyGuestDxtBlocks(t, p, pitch, snapshot, snapshotSize);
+        up->Unmap(0, nullptr);
+        ID3D12Resource* tex = ok ? CreateTexture(t.width, t.height, fmt) : nullptr;
+        if (!tex) { up->Release(); return nullptr; }
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = up;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint = { fmt, t.width, t.height, 1, pitch };
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         Barrier(list, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         f.release.push_back(up);
@@ -288,23 +317,32 @@ namespace
     // Decoded BGRA -> the format's native components (x, y, z, w), then the fetch swizzle.
     void ApplySwizzle(std::vector<uint32_t>& px, uint32_t format, uint32_t swizzle)
     {
+        // Each output channel is a byte of the decoded BGRA texel or a constant: work the
+        // mapping out once (format's component order, then the fetch swizzle), apply it per texel.
         bool dxt = format == 18 || format == 19 || format == 20 || format == 52 || format == 53 || format == 54;
+        enum { B = 0, G = 1, R = 2, A = 3, Zero = 4, One = 5 };
+        int n[4];
+        if (dxt || format == 4) { n[0] = R; n[1] = G; n[2] = B; n[3] = A; }        // DXT, 5_6_5
+        else if (format == 6 || format == 26) { n[0] = B; n[1] = G; n[2] = R; n[3] = A; }   // 8_8_8_8 / 16_16_16_16: x = first component
+        else if (format == 2) { n[0] = R; n[1] = Zero; n[2] = Zero; n[3] = One; }   // 8
+        else if (format == 10) { n[0] = R; n[1] = A; n[2] = Zero; n[3] = One; }     // 8_8
+        else { n[0] = R; n[1] = G; n[2] = B; n[3] = A; }
+        int shift[4];
+        uint32_t constant = 0, keep = 0;
+        for (int c = 0; c < 4; c++)
+        {
+            uint32_t sw = (swizzle >> (3 * c)) & 7;
+            int src = sw < 4 ? n[sw] : (sw == 4 ? Zero : One);
+            shift[c] = -1;
+            if (src == One) constant |= 0xFFu << (8 * c);
+            else if (src != Zero) { shift[c] = src; keep |= 1u << c; }
+        }
         for (uint32_t& p : px)
         {
-            uint8_t b = uint8_t(p), g = uint8_t(p >> 8), r = uint8_t(p >> 16), a = uint8_t(p >> 24);
-            uint8_t n[4];
-            if (dxt || format == 4) { n[0] = r; n[1] = g; n[2] = b; n[3] = a; }       // DXT, 5_6_5
-            else if (format == 6 || format == 26) { n[0] = b; n[1] = g; n[2] = r; n[3] = a; }   // 8_8_8_8 / 16_16_16_16: x = first component
-            else if (format == 2) { n[0] = r; n[1] = 0; n[2] = 0; n[3] = 255; }       // 8
-            else if (format == 10) { n[0] = r; n[1] = a; n[2] = 0; n[3] = 255; }      // 8_8
-            else { n[0] = r; n[1] = g; n[2] = b; n[3] = a; }
-            uint8_t o[4];
+            uint32_t o = constant;
             for (int c = 0; c < 4; c++)
-            {
-                uint32_t s = (swizzle >> (3 * c)) & 7;
-                o[c] = s < 4 ? n[s] : (s == 4 ? 0 : 255);
-            }
-            p = o[0] | (o[1] << 8) | (o[2] << 16) | (uint32_t(o[3]) << 24);   // R8G8B8A8
+                if (keep & (1u << c)) o |= ((p >> (8 * shift[c])) & 0xFFu) << (8 * c);
+            p = o;   // R8G8B8A8
         }
     }
 
@@ -359,15 +397,23 @@ namespace
             it->second.lastFrame = g_frameCounter;
             return it->second.cpuSrv;
         }
-        std::vector<uint32_t> px;
-        if (!DecodeGuestTexture(t, px, content ? content->data.data() : nullptr, content ? content->data.size() : 0))
+        // DXT: upload the blocks as they are; the fetch swizzle becomes the view's mapping
+        // (decoded DXT texels are x, y, z, w = R, G, B, A, as ApplySwizzle maps them).
+        bool native = false;
+        ID3D12Resource* tex = UploadDxtTexture(list, fr, t, content ? content->data.data() : nullptr, content ? content->data.size() : 0);
+        if (tex) native = true;
+        else
         {
-            static int logged = 0;
-            if (logged++ < 20) Log("[draw] texture format %u (%ux%u) not decoded", t.format, t.width, t.height);
-            return 0;
+            std::vector<uint32_t> px;
+            if (!DecodeGuestTexture(t, px, content ? content->data.data() : nullptr, content ? content->data.size() : 0))
+            {
+                static int logged = 0;
+                if (logged++ < 20) Log("[draw] texture format %u (%ux%u) not decoded", t.format, t.width, t.height);
+                return 0;
+            }
+            ApplySwizzle(px, t.format, swizzle);
+            tex = UploadTexture(list, fr, px, t.width, t.height);
         }
-        ApplySwizzle(px, t.format, swizzle);
-        ID3D12Resource* tex = UploadTexture(list, fr, px, t.width, t.height);
         if (!tex) return 0;
         CachedTexture& c = g_textures[key];
         if (c.resource) fr.release.push_back(c.resource);
@@ -382,7 +428,22 @@ namespace
         c.keep = content ? snap : nullptr;
         c.contentHash = content ? 0 : SampleHash(t);
         c.lastFrame = g_frameCounter;
-        g_dev->CreateShaderResourceView(tex, nullptr, CpuSrv(c.cpuSrv));
+        if (native)
+        {
+            UINT map[4];
+            for (int ch = 0; ch < 4; ch++)
+            {
+                uint32_t sw = (swizzle >> (3 * ch)) & 7;
+                map[ch] = sw < 4 ? sw : sw == 4 ? D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0 : D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1;
+            }
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = tex->GetDesc().Format;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(map[0], map[1], map[2], map[3]);
+            sd.Texture2D.MipLevels = 1;
+            g_dev->CreateShaderResourceView(tex, &sd, CpuSrv(c.cpuSrv));
+        }
+        else g_dev->CreateShaderResourceView(tex, nullptr, CpuSrv(c.cpuSrv));
         return c.cpuSrv;
     }
 

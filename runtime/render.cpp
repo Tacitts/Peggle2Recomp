@@ -86,7 +86,7 @@ namespace
 
     // Decode mip 0 of a texture into BGRA8 (w x h). Returns false for unsupported formats.
     // `snapshot` (optional): a copy of the texture's footprint taken when the draw was recorded.
-    bool DecodeTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot = nullptr, size_t snapshotSize = 0)
+    bool DecodeTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot = nullptr, size_t snapshotSize = 0, bool allowFast = true)
     {
         enum { k_8 = 2, k_5_6_5 = 4, k_8_8_8_8 = 6, k_8_8 = 10, k_DXT1 = 18, k_DXT2_3 = 19, k_DXT4_5 = 20, k_16_16_16_16 = 26,
                k_DXT1_AS_16 = 52, k_DXT2_3_AS_16 = 53, k_DXT4_5_AS_16 = 54 };
@@ -106,6 +106,47 @@ namespace
         uint32_t pitchBlocks = std::max<uint32_t>((t.pitch ? t.pitch : w) / blockDim, bw);
         if (t.tiled) pitchBlocks = (pitchBlocks + 31) & ~31u;
         out.assign(size_t(w) * h, 0xFF000000u);
+
+        // Fast path: one texel per block, the whole footprint readable, and a byte order that
+        // stays inside the texel (as the general loop below would apply it).
+        if (allowFast && blockDim == 1 && (t.endian == 0 || bpb >= 4 || (bpb == 2 && t.endian == 1)))
+        {
+            uint64_t footprint = t.tiled ? uint64_t(pitchBlocks) * ((bh + 31) & ~31u) * bpb
+                                         : (uint64_t(bh - 1) * pitchBlocks + bw) * bpb;
+            const uint8_t* base = nullptr;
+            if (snapshot) base = footprint <= snapshotSize ? snapshot : nullptr;
+            else if (uint64_t(t.address) + footprint <= 0xC0000000ull) base = (const uint8_t*)GuestPtr(t.address);
+            if (base)
+            {
+                if (fmt == k_8 && !t.tiled)   // movie planes: expand each byte to grey, opaque
+                {
+                    for (uint32_t y = 0; y < h; y++)
+                    {
+                        const uint8_t* s = base + size_t(y) * pitchBlocks;
+                        uint32_t* o = out.data() + size_t(y) * w;
+                        for (uint32_t x = 0; x < w; x++) o[x] = 0xFF000000u | (uint32_t(s[x]) * 0x010101u);
+                    }
+                    return true;
+                }
+                for (uint32_t y = 0; y < h; y++)
+                {
+                    uint32_t* o = out.data() + size_t(y) * w;
+                    for (uint32_t x = 0; x < w; x++)
+                    {
+                        uint32_t idx = t.tiled ? TiledOffset(x, y, pitchBlocks, bpb) : y * pitchBlocks + x;
+                        uint8_t block[8];
+                        memcpy(block, base + size_t(idx) * bpb, bpb);
+                        if (t.endian) SwapBlock(block, bpb < 4 ? 4 : bpb, t.endian);   // bpb 2: 8in16 only
+                        if (fmt == k_8) o[x] = 0xFF000000u | (block[0] * 0x010101u);
+                        else if (fmt == k_8_8) o[x] = (uint32_t(block[1]) << 24) | (block[0] * 0x010101u);
+                        else if (fmt == k_5_6_5) o[x] = Rgb565ToBgra(uint16_t(block[0] | (block[1] << 8)));
+                        else if (fmt == k_16_16_16_16) o[x] = block[1] | (block[3] << 8) | (block[5] << 16) | (uint32_t(block[7]) << 24);
+                        else o[x] = block[0] | (block[1] << 8) | (block[2] << 16) | (uint32_t(block[3]) << 24);
+                    }
+                }
+                return true;
+            }
+        }
         uint8_t block[16];
         for (uint32_t by = 0; by < bh; by++)
         {
@@ -172,6 +213,42 @@ namespace
 bool DecodeGuestTexture(const GuestTextureInfo& t, std::vector<uint32_t>& out, const uint8_t* snapshot, size_t snapshotSize)
 {
     return DecodeTexture(t, out, snapshot, snapshotSize);
+}
+
+bool GuestDxtUploadable(const GuestTextureInfo& t, uint32_t& bpb)
+{
+    switch (t.format)
+    {
+    case 18: case 52: bpb = 8; break;                            // DXT1
+    case 19: case 20: case 53: case 54: bpb = 16; break;         // DXT2/3, DXT4/5
+    default: return false;
+    }
+    return (t.width % 4) == 0 && (t.height % 4) == 0 && t.endian <= 1;
+}
+
+bool CopyGuestDxtBlocks(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPitch, const uint8_t* snapshot, size_t snapshotSize)
+{
+    uint32_t bpb;
+    if (!GuestDxtUploadable(t, bpb)) return false;
+    uint32_t bw = t.width / 4, bh = t.height / 4;
+    uint32_t pitchBlocks = std::max<uint32_t>((t.pitch ? t.pitch : t.width) / 4, bw);
+    if (t.tiled) pitchBlocks = (pitchBlocks + 31) & ~31u;
+    uint64_t footprint = t.tiled ? uint64_t(pitchBlocks) * ((bh + 31) & ~31u) * bpb : (uint64_t(bh - 1) * pitchBlocks + bw) * bpb;
+    const uint8_t* base = nullptr;
+    if (snapshot) base = footprint <= snapshotSize ? snapshot : nullptr;
+    else if (uint64_t(t.address) + footprint <= 0xC0000000ull) base = (const uint8_t*)GuestPtr(t.address);
+    if (!base) return false;
+    for (uint32_t by = 0; by < bh; by++)
+    {
+        uint8_t* row = dst + size_t(by) * dstPitch;
+        if (!t.tiled) memcpy(row, base + size_t(by) * pitchBlocks * bpb, size_t(bw) * bpb);
+        else
+            for (uint32_t bx = 0; bx < bw; bx++)
+                memcpy(row + size_t(bx) * bpb, base + size_t(TiledOffset(bx, by, pitchBlocks, bpb)) * bpb, bpb);
+        if (t.endian == 1)   // 8in16: swap the bytes of every 16-bit word
+            for (size_t i = 0; i + 1 < size_t(bw) * bpb; i += 2) std::swap(row[i], row[i + 1]);
+    }
+    return true;
 }
 
 // Bytes of guest memory mip 0 occupies (tiled textures: width and height padded to 32 blocks).
