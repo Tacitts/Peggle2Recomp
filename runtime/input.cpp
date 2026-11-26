@@ -86,6 +86,8 @@ namespace
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
         if (ms % 1500 >= 150)
             return 0;
+        static const bool onlyA = getenv("PEGGLE2_AUTOPRESS")[0] == 'a' || getenv("PEGGLE2_AUTOPRESS")[0] == 'A';
+        if (onlyA) return 0x1000;   // PEGGLE2_AUTOPRESS=A: only A (fires shots without pausing)
         return ((ms / 1500) % 2) ? 0x0010 /* START */ : 0x1000 /* A */;
     }
 
