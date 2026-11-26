@@ -62,6 +62,7 @@ struct TranslatedShader
     std::vector<uint8_t> dxil;
 };
 std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixel, const std::vector<uint32_t>& beWords);
+void PrefetchShader(uint64_t hash, bool pixel, std::vector<uint32_t> beWords);
 // Plain HLSL -> DXIL with the same compiler (runtime-owned shaders, e.g. the present blit).
 bool CompileHlsl(const std::string& hlsl, const wchar_t* target, std::vector<uint8_t>& dxil, std::string& errors);
 

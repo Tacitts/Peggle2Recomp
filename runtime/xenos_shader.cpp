@@ -14,7 +14,10 @@
 // before runtime.h, whose ppc_context.h defines short macros.
 #include "shader_recompiler.h"
 
+#include <chrono>
+#include <future>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "xenos.h"
@@ -256,14 +259,13 @@ ShaderInfo AnalyzeShader(bool pixel, const std::vector<uint32_t>& be)
     return info;
 }
 
-std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixel, const std::vector<uint32_t>& be)
+static std::shared_ptr<const TranslatedShader> TranslateShaderNow(uint64_t hash, bool pixel, const std::vector<uint32_t>& be)
 {
-    {
-        std::lock_guard<std::mutex> g(g_cacheLock);
-        auto it = g_cache.find(hash);
-        if (it != g_cache.end()) return it->second;
-        if (g_failed.count(hash)) return nullptr;
-    }
+    // One translation at a time (XenosRecomp and the shared DXC compiler object are not
+    // documented as thread-safe); waiting callers get this result through g_inflight.
+    static std::mutex translateLock;
+    std::lock_guard<std::mutex> one(translateLock);
+    auto start = std::chrono::steady_clock::now();
     auto t = std::make_shared<TranslatedShader>();
     t->info = AnalyzeShader(pixel, be);
     std::vector<std::pair<uint32_t, uint32_t>> vfetch;
@@ -331,10 +333,52 @@ std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixe
         Log("[shader] %s %016llX: translation failed: %.1500s", pixel ? "ps" : "vs", (unsigned long long)hash, errors.c_str());
         return nullptr;
     }
-    Log("[shader] %s %016llX: %zu bytes DXIL, %zu vertex elements, textures 0x%X", pixel ? "ps" : "vs",
-        (unsigned long long)hash, t->dxil.size(), t->info.vertexElements.size(), t->info.textureSlotMask);
+    Log("[shader] %s %016llX: %zu bytes DXIL, %zu vertex elements, textures 0x%X (%.1f ms)", pixel ? "ps" : "vs",
+        (unsigned long long)hash, t->dxil.size(), t->info.vertexElements.size(), t->info.textureSlotMask,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     g_cache[hash] = t;
     return t;
+}
+
+// Translate (or fetch from the caches) once per microcode hash; a caller that arrives while
+// another thread is translating the same shader waits for that result instead of redoing it.
+namespace { std::unordered_map<uint64_t, std::shared_future<std::shared_ptr<const TranslatedShader>>> g_inflight; }
+std::shared_ptr<const TranslatedShader> TranslateShader(uint64_t hash, bool pixel, const std::vector<uint32_t>& be)
+{
+    std::promise<std::shared_ptr<const TranslatedShader>> promise;
+    {
+        std::unique_lock<std::mutex> g(g_cacheLock);
+        auto it = g_cache.find(hash);
+        if (it != g_cache.end()) return it->second;
+        if (g_failed.count(hash)) return nullptr;
+        auto in = g_inflight.find(hash);
+        if (in != g_inflight.end())
+        {
+            auto f = in->second;
+            g.unlock();
+            auto start = std::chrono::steady_clock::now();
+            auto r = f.get();
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (ms > 1) Log("[shader] %016llX: waited %.1f ms for the background compile", (unsigned long long)hash, ms);
+            return r;
+        }
+        g_inflight[hash] = promise.get_future().share();
+    }
+    auto r = TranslateShaderNow(hash, pixel, be);
+    promise.set_value(r);
+    std::lock_guard<std::mutex> g(g_cacheLock);
+    g_inflight.erase(hash);
+    return r;
+}
+
+// Start translating a shader the title just loaded (IM_LOAD), ahead of its first draw.
+void PrefetchShader(uint64_t hash, bool pixel, std::vector<uint32_t> beWords)
+{
+    {
+        std::lock_guard<std::mutex> g(g_cacheLock);
+        if (g_cache.count(hash) || g_failed.count(hash) || g_inflight.count(hash)) return;
+    }
+    std::thread([hash, pixel, words = std::move(beWords)] { TranslateShader(hash, pixel, words); }).detach();
 }
 
 bool CompileHlsl(const std::string& hlsl, const wchar_t* target, std::vector<uint8_t>& dxil, std::string& errors)

@@ -104,6 +104,7 @@ namespace
         std::lock_guard<std::mutex> g(g_microcodeLock);
         if (g_microcode.count(s.hash)) return;
         g_microcode[s.hash] = std::make_shared<const std::vector<uint32_t>>(s.words);
+        PrefetchShader(s.hash, type == 1, s.words);   // compile ahead of the first draw
         auto dir = UserDataDir().parent_path() / "microcode";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
