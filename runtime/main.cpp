@@ -445,6 +445,161 @@ static void ProfilerThread(double startSeconds, double seconds)
     }
 }
 
+// ---- Spike profiler (PEGGLE2_PROFILE=spikes) ------------------------------------------------------
+// Samples every thread about once a millisecond into a ring. VdSwap reports game frames slower
+// than 40 ms (ProfilerReportSpike); for each, the log gets the frame's length and, per thread that
+// was busy in it, the functions its samples fell in.
+namespace
+{
+    struct SpikeSample { int64_t qpc; DWORD tid; uint64_t rip; };
+    constexpr size_t kSpikeRing = 1 << 20;
+    std::vector<SpikeSample> g_spikeRing;
+    std::atomic<uint64_t> g_spikePos{ 0 };
+    std::atomic<bool> g_spikeMode{ false };
+    std::mutex g_spikeReqLock;
+    std::vector<std::pair<int64_t, int64_t>> g_spikeReqs;
+}
+
+void ProfilerReportSpike(int64_t qpcStart, int64_t qpcEnd)
+{
+    if (!g_spikeMode.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> g(g_spikeReqLock);
+    if (g_spikeReqs.size() < 64) g_spikeReqs.push_back({ qpcStart, qpcEnd });
+}
+
+static void SpikeProfilerThread()
+{
+    NameHostThread("profiler");
+    g_spikeRing.resize(kSpikeRing);
+    g_spikeMode = true;
+    std::unordered_map<DWORD, ProfThread> threads;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    auto refresh = [&] {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+        {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            auto it = threads.find(te.th32ThreadID);
+            if (it != threads.end() && it->second.name.rfind("host ", 0) != 0) continue;   // named already
+            HANDLE h = it != threads.end() ? it->second.h
+                     : OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            ProfThread& t = threads[te.th32ThreadID];
+            t.h = h;
+            PWSTR d = nullptr;
+            char name[128] = "";
+            if (SUCCEEDED(GetThreadDescription(h, &d)) && d)
+            {
+                WideCharToMultiByte(CP_UTF8, 0, d, -1, name, sizeof(name), nullptr, nullptr);
+                LocalFree(d);
+            }
+            t.name = name[0] ? name : ("host " + std::to_string(te.th32ThreadID));
+        }
+        CloseHandle(snap);
+    };
+    {
+        std::lock_guard<std::mutex> g(g_symLock);
+        if (!g_symReady)
+        {
+            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+            g_symReady = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+        }
+    }
+    std::unordered_map<uint64_t, std::string> symCache;
+    auto symName = [&](uint64_t rip) -> const std::string& {
+        auto it = symCache.find(rip);
+        if (it != symCache.end()) return it->second;
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+        auto* si = (SYMBOL_INFO*)buf;
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        std::string name;
+        {
+            std::lock_guard<std::mutex> g(g_symLock);
+            IMAGEHLP_MODULE64 mi{};
+            mi.SizeOfStruct = sizeof(mi);
+            std::string mod = SymGetModuleInfo64(GetCurrentProcess(), rip, &mi) ? std::string(mi.ModuleName) + "!" : "?!";
+            if (SymFromAddr(GetCurrentProcess(), rip, &disp, si)) name = mod + si->Name;
+            else { char b[32]; snprintf(b, sizeof(b), "%llX", (unsigned long long)rip); name = mod + b; }
+        }
+        return symCache.emplace(rip, std::move(name)).first->second;
+    };
+    auto isWait = [](const std::string& n) {
+        return n.find("ntdll!Zw") == 0 || n.find("ntdll!Nt") == 0 || n.find("SleepConditionVariable") != std::string::npos ||
+               n.find("RtlDelayExecution") != std::string::npos || n.find("SwitchToThread") != std::string::npos;
+    };
+
+    timeBeginPeriod(1);
+    Log("[profile] spike mode: game frames over 40 ms are broken down per thread");
+    std::vector<std::pair<DWORD, uint64_t>> got;
+    got.reserve(256);
+    for (uint64_t round = 0;; round++)
+    {
+        if (round % 500 == 0) refresh();
+        got.clear();
+        for (auto& [id, t] : threads)
+        {
+            if (SuspendThread(t.h) == DWORD(-1)) continue;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL;
+            BOOL ok = GetThreadContext(t.h, &c);
+            ResumeThread(t.h);
+            if (ok) got.push_back({ id, c.Rip });
+        }
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        for (auto& [id, rip] : got) g_spikeRing[g_spikePos++ % kSpikeRing] = { now.QuadPart, id, rip };
+
+        // Reports whose frame ended at least 5 ms ago.
+        std::vector<std::pair<int64_t, int64_t>> due;
+        {
+            std::lock_guard<std::mutex> g(g_spikeReqLock);
+            for (size_t i = 0; i < g_spikeReqs.size();)
+                if (now.QuadPart - g_spikeReqs[i].second > f.QuadPart / 200) { due.push_back(g_spikeReqs[i]); g_spikeReqs.erase(g_spikeReqs.begin() + i); }
+                else i++;
+        }
+        for (auto [a, b] : due)
+        {
+            std::unordered_map<DWORD, std::unordered_map<std::string, uint32_t>> byThread;
+            std::unordered_map<DWORD, uint32_t> total;
+            uint64_t end = g_spikePos.load();
+            for (uint64_t k = end > kSpikeRing ? end - kSpikeRing : 0; k < end; k++)
+            {
+                const SpikeSample& s = g_spikeRing[k % kSpikeRing];
+                if (s.qpc < a || s.qpc > b) continue;
+                total[s.tid]++;
+                const std::string& n = symName(s.rip);
+                if (!isWait(n)) byThread[s.tid][n]++;
+            }
+            Log("[spike] game frame took %.1f ms", double(b - a) * 1000.0 / f.QuadPart);
+            for (auto& [tid, funcs] : byThread)
+            {
+                uint32_t busy = 0;
+                for (auto& [n, c] : funcs) busy += c;
+                if (busy * 10 < total[tid]) continue;   // under 10% busy: skip
+                std::vector<std::pair<uint32_t, std::string>> top;
+                for (auto& [n, c] : funcs) top.push_back({ c, n });
+                std::sort(top.rbegin(), top.rend());
+                std::string line;
+                for (size_t i = 0; i < top.size() && i < 8; i++)
+                {
+                    char buf[300];
+                    snprintf(buf, sizeof(buf), "%s%u %s", i ? ", " : "", top[i].first, top[i].second.c_str());
+                    line += buf;
+                }
+                auto it = threads.find(tid);
+                Log("[spike]   %-24s busy %u/%u samples: %s", it != threads.end() ? it->second.name.c_str() : "?", busy, total[tid], line.c_str());
+            }
+        }
+        Sleep(1);
+    }
+}
+
 int main(int argc, char** argv)
 {
     RotateLogs();
@@ -498,7 +653,9 @@ int main(int argc, char** argv)
         if (!FuncSlot(uint32_t(a))) { FuncSlot(uint32_t(a)) = MissingFunctionTrap; traps++; }
     Log("[boot] %zu recompiled functions registered (%zu other code addresses trap)", mapped, traps);
     BuildHostToGuest();
-    if (const char* p = getenv("PEGGLE2_PROFILE"))   // "start,seconds": sample all threads
+    if (const char* p = getenv("PEGGLE2_PROFILE"); p && strcmp(p, "spikes") == 0)
+        std::thread(SpikeProfilerThread).detach();
+    else if (p)   // "start,seconds": sample all threads
     {
         double start = atof(p), secs = strchr(p, ',') ? atof(strchr(p, ',') + 1) : 20;
         std::thread(ProfilerThread, start, secs).detach();

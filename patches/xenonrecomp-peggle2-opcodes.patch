@@ -16,7 +16,7 @@ index 34add40..cb6173b 100644
                      {
                          // right block's just going to return
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..078f802 100644
+index fa91527..73a1f8c 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -263,7 +263,9 @@ bool Recompiler::Recompile(
@@ -342,3 +342,26 @@ index fa91527..078f802 100644
          break;
  
      case PPC_INST_TDLGEI:
+@@ -2443,6 +2680,22 @@ bool Recompiler::Recompile(const Function& fn)
+         fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
+ #endif
+ 
++    // The last instruction can continue to the next address (a conditional branch, or a call
++    // that returns): on the console execution runs on into the code that follows, so do the
++    // same by calling the function that starts there. Seen at 0x825A63E8, the end of a CTR
++    // switch whose last case falls through into the next function.
++    if (insn.opcode != nullptr && insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BLR &&
++        insn.opcode->id != PPC_INST_BCTR)
++    {
++        auto next = image.symbols.find(end);
++        if (next != image.symbols.end() && next->address == end && next->type == Symbol_Function)
++        {
++            println("	// fall through into the next function");
++            println("	{}(ctx, base);", next->name);
++            println("	return;");
++        }
++    }
++
+     println("}}\n");
+ 
+ #ifndef XENON_RECOMP_USE_ALIAS

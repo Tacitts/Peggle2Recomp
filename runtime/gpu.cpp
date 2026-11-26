@@ -950,6 +950,14 @@ static void DumpShaderContainers()
 static std::atomic<uint32_t> g_swaps{ 0 };
 IMPORT(VdSwap)
 {
+    {   // Slow game frames (time between swaps) for the spike profiler.
+        static LARGE_INTEGER last{};
+        LARGE_INTEGER now, f;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&f);
+        if (last.QuadPart && now.QuadPart - last.QuadPart > f.QuadPart / 25) ProfilerReportSpike(last.QuadPart, now.QuadPart);
+        last = now;
+    }
     if (uint32_t buf = ctx.r3.u32)
     {
         Store32(buf, (3u << 30) | ((63u - 1) << 16) | (PM4_NOP << 8));
@@ -984,7 +992,9 @@ IMPORT(VdSwap)
     // Old shader-capture aid (a memory scan that stalls ~0.3 s): only with PEGGLE2_SHADER_SCAN.
     static const bool shaderScan = getenv("PEGGLE2_SHADER_SCAN") != nullptr;
     if (shaderScan && (n == 300 || n == 1200)) DumpShaderContainers();   // after loading screens have run
-    if (n == 600) DumpPacketStats();
-    if (n == 600 || n == 3000) DumpDrawKinds();
+    // Old debugging statistics (logging them stalls the swap): only with PEGGLE2_GPU_STATS.
+    static const bool gpuStats = getenv("PEGGLE2_GPU_STATS") != nullptr;
+    if (gpuStats && n == 600) DumpPacketStats();
+    if (gpuStats && (n == 600 || n == 3000)) DumpDrawKinds();
     ctx.r3.u64 = 0;
 }
