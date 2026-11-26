@@ -1,6 +1,6 @@
 // Launcher: a settings window shown before the game starts (settings.h). Plain Win32 controls
-// (common controls v6), no extra dependencies. Opens when [launcher] show_on_start is set, when
-// Shift is held at start, or when the game files are missing. Returns whether to start the game.
+// (common controls v6), no extra dependencies. One executable: it opens every time, and Play starts
+// the game in the same process. Returns whether to start the game.
 #ifndef UNICODE
 #define UNICODE   // the ListView_/TabCtrl_ macros pick the wide-character messages
 #define _UNICODE
@@ -229,8 +229,7 @@ namespace
                 if (g_info.installPackage(g_wnd)) { g_info.gameFound = true; MessageBoxW(g_wnd, L"Installed. Press Play to start.", L"Peggle 2", MB_ICONINFORMATION); }
             });
         Combo<bool>(p, 0, 120, 120, 200, L"Game mode:", &s.trial, { { L"Full game", false }, { L"Trial", true } });
-        Check(p, 0, 160, 640, L"Show this launcher at startup (hold Shift while starting to open it anyway)", &s.showLauncher);
-        Note(p, 0, 200, 660, 120,
+        Note(p, 0, 160, 660, 120,
              L"Keys while playing: F11 or Alt+Enter fullscreen, F2 frame counter, F3 performance overlay, F12 screenshot.\n\n"
              L"Keyboard: arrows or WASD aim, Space fires, Enter pauses, Esc goes back (rebind on the Controls page).");
     }
@@ -545,10 +544,11 @@ namespace
 
 bool LauncherWanted(bool gameFound)
 {
-    if (!gameFound || getenv("PEGGLE2_LAUNCHER")) return true;
-    // Automated runs (soak/benchmark scripts, autopress) never stop at the launcher.
-    if (getenv("PEGGLE2_NO_LAUNCHER") || getenv("PEGGLE2_AUTOPRESS")) return false;
-    return GetSettings().showLauncher || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    // The game is always started from the launcher (one executable: launcher, then game).
+    // Only automated runs (soak/benchmark scripts, autopress) skip it, and only when the
+    // game files are there.
+    if (gameFound && (getenv("PEGGLE2_NO_LAUNCHER") || getenv("PEGGLE2_AUTOPRESS")) && !getenv("PEGGLE2_LAUNCHER")) return false;
+    return true;
 }
 
 bool RunLauncher(const LauncherInfo& info)

@@ -54,13 +54,12 @@ written by `xexdump --dump-image`.
 
 ## Launcher and settings
 
-`Peggle2.exe` opens a launcher first (turn that off on its Play page; hold Shift while starting
-to get it back). Everything is saved to `peggle2_settings.ini` next to the program, a plain-text
-file that can also be edited by hand. Automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`)
-skip it.
+`Peggle2.exe` is both the launcher and the game: it always opens the launcher, and Play starts the
+game. Everything is saved to `peggle2_settings.ini` next to the program, a plain-text file that can
+also be edited by hand. Only automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`) skip it.
 
 - **Play:** install the game from your own Xbox Live Arcade package (the title ID is checked; the
-  files go to `game\` next to the program), full game or trial, launcher at startup.
+  files go to `game\` next to the program), full game or trial.
 - **Display:** fullscreen (F11 or Alt+Enter while playing), monitor, window size (or fit to the
   screen), keep 16:9 with bars or stretch, VSync.
 - **Graphics:** render resolution (the window's own resolution, or at least 2x-4x supersampled),

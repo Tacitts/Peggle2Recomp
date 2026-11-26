@@ -102,7 +102,6 @@ void LoadPortSettings()
     auto B = [&](const char* k, bool& out) { if (auto* v = get(k)) out = ParseBool(*v, out); };
     auto I = [&](const char* k, int& out, int lo, int hi) { if (auto* v = get(k)) out = ParseInt(*v, out, lo, hi); };
     auto S = [&](const char* k, std::string& out) { if (auto* v = get(k)) out = *v; };
-    B("launcher.show_on_start", s.showLauncher);
     B("display.fullscreen", s.fullscreen);
     I("display.monitor", s.monitor, 0, 16);
     I("display.window_width", s.windowWidth, 0, 16384);
@@ -155,7 +154,6 @@ bool SavePortSettings()
     std::ostringstream o;
     auto b = [](bool v) { return v ? "true" : "false"; };
     o << "# Peggle 2 recompiled: settings (written by the launcher; safe to edit by hand)\n\n";
-    o << "[launcher]\nshow_on_start = " << b(s.showLauncher) << "\n\n";
     o << "[display]\nfullscreen = " << b(s.fullscreen) << "\nmonitor = " << s.monitor
       << "\nwindow_width = " << s.windowWidth << "\nwindow_height = " << s.windowHeight
       << "\nstretch = " << b(s.stretch) << "\nvsync = " << b(s.vsync) << "\n\n";

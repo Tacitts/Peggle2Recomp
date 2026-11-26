@@ -8,8 +8,7 @@
 
 struct Settings
 {
-    // [launcher]
-    bool showLauncher = true;          // open the launcher at startup (Shift at start always does)
+    // (No [launcher] options: the launcher always opens before the game.)
 
     // [display]
     bool fullscreen = false;           // borderless fullscreen on `monitor` (F11 / Alt+Enter toggle)
