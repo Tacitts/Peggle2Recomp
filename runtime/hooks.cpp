@@ -11,6 +11,9 @@
 // Note: a hooked function's original body (__imp__sub_X) may be attributed in call chains
 // to the guest function that precedes it, because the function table points at the hook.
 #include "runtime.h"
+#include "xenos.h"
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 
 #define TRACE_FUNC(addr, label)                                                              \
@@ -78,6 +81,33 @@ PPC_FUNC(sub_82453B78)
     __imp__sub_82453B78(ctx, base);
 }
 
+// ---- Flip pacing ---------------------------------------------------------------------------
+// The title's D3D counts flips at device+16976: its vblank handler (0x8261EF88, r3 = device)
+// flips queued frames whose target vblank has come, and the flip-request handler (0x8261F0B8,
+// GPU interrupt) flips at once when a frame is due now. Each increase is one frame flipped,
+// in order; the renderer then presents the next submitted frame (render.cpp).
+static std::atomic<uint32_t> g_d3dDevice{ 0 };
+static uint32_t g_flipCount = 0;   // GPU thread only (both handlers run on it)
+static void NoteFlips()
+{
+    uint32_t dev = g_d3dDevice.load(std::memory_order_relaxed);
+    if (!dev) return;
+    uint32_t n = Load32(dev + 16976);
+    for (uint32_t i = g_flipCount; i != n && n - i < 8; i++) RendererGuestFlip();
+    g_flipCount = n;
+}
+PPC_FUNC_IMPL(__imp__sub_8261EF88);
+PPC_FUNC(sub_8261EF88)
+{
+    if (!g_d3dDevice.load(std::memory_order_relaxed))
+    {
+        g_d3dDevice = ctx.r3.u32;
+        g_flipCount = Load32(ctx.r3.u32 + 16976);
+    }
+    __imp__sub_8261EF88(ctx, base);
+    NoteFlips();
+}
+
 // ---- Optional 60 fps: PEGGLE2_60FPS=1 -----------------------------------------------------------
 // The title runs its logic at a fixed 60 updates per second and draws every second update: the
 // frame step (0x8242F8A8, loop mode byte 0x828CE748 = 1) calls the update (0x8242F2C8) and the
@@ -97,7 +127,18 @@ PPC_FUNC(sub_8261F0B8)
 {
     if (Sixty() && ((ctx.r3.u32 >> 8) & 0xF) > 1)
         ctx.r3.u64 = (ctx.r3.u32 & ~0xF00u) | 0x100u;
+    // Tear window (low byte, percent of a vblank): a frame that is due but arrives more than 5%
+    // into the current vblank waits for the next one, to avoid tearing on the console. Our
+    // presentation is always vsynced (no tearing possible) and adds its own vblank of latency,
+    // so that wait only made late movie frames later and pushed the following flips back.
+    // 100% flips a late frame at once. PEGGLE2_TEAR_WINDOW=<percent> overrides (5 = console).
+    static const uint32_t tearWindow = [] {
+        const char* v = getenv("PEGGLE2_TEAR_WINDOW");
+        return v ? uint32_t(std::clamp(atoi(v), 0, 100)) : 100u;
+    }();
+    ctx.r3.u64 = (ctx.r3.u32 & ~0xFFu) | tearWindow;
     __imp__sub_8261F0B8(ctx, base);
+    NoteFlips();   // an immediate flip
 }
 PPC_FUNC_IMPL(__imp__sub_8242F2C8);
 PPC_FUNC(sub_8242F2C8)

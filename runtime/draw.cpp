@@ -11,6 +11,7 @@
 //     applied, cached by description + a sampled content hash;
 //   - blending, colour write mask, scissor and the simple alpha-test functions from registers.
 #include "runtime.h"
+#include "settings.h"
 #include "xenos.h"
 
 #include <algorithm>
@@ -467,6 +468,13 @@ namespace
         s.AddressV = mode((f[0] >> 13) & 7);
         s.AddressW = mode((f[0] >> 16) & 7);
         s.MaxAnisotropy = 1;
+        // Launcher: anisotropic filtering for textures the game filters linearly (point-sampled
+        // pixel art and lookup textures stay as they are).
+        if (int aniso = GetSettings().anisotropy; aniso > 1 && linearMin && linearMag)
+        {
+            s.Filter = D3D12_FILTER_ANISOTROPIC;
+            s.MaxAnisotropy = UINT(std::min(aniso, 16));
+        }
         s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         s.MaxLOD = D3D12_FLOAT32_MAX;
         return s;
@@ -1026,7 +1034,28 @@ namespace
         static const char* kPs =
             "Texture2D<float4> g_Tex[] : register(t0, space0);\n"
             "SamplerState g_Smp[] : register(s0, space3);\n"
-            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return float4(g_Tex[0].Sample(g_Smp[0], uv).rgb, 1); }\n";
+            "cbuffer Blit : register(b2, space4) { float4 g_Uv; float4 g_Texel; };\n"
+            "float3 At(float2 uv) { return g_Tex[0].SampleLevel(g_Smp[0], uv, 0).rgb; }\n"
+            "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  float3 c = At(uv);\n"
+            "  if (g_Texel.z == 0) return float4(c, 1);\n"
+            "  float2 t = g_Texel.xy;\n"
+            "  float lm = Luma(c);\n"
+            "  float ln = Luma(At(uv + float2(0, -t.y))), ls = Luma(At(uv + float2(0, t.y)));\n"
+            "  float le = Luma(At(uv + float2(t.x, 0))), lw = Luma(At(uv + float2(-t.x, 0)));\n"
+            "  float lo = min(lm, min(min(ln, ls), min(le, lw))), hi = max(lm, max(max(ln, ls), max(le, lw)));\n"
+            "  if (hi - lo < max(0.04, hi * 0.15)) return float4(c, 1);\n"
+            "  float a = Luma(At(uv + float2(-t.x, -t.y))), b = Luma(At(uv + float2(t.x, -t.y)));\n"
+            "  float d = Luma(At(uv + float2(-t.x, t.y))), e = Luma(At(uv + float2(t.x, t.y)));\n"
+            "  float2 dir = float2((d + e) - (a + b), (a + d) - (b + e));\n"
+            "  float bias = max((a + b + d + e) * 0.03, 1.0 / 128.0);\n"
+            "  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + bias), -6.0, 6.0) * t;\n"
+            "  float3 near = 0.5 * (At(uv - dir / 6.0) + At(uv + dir / 6.0));\n"
+            "  float3 wide = 0.5 * near + 0.25 * (At(uv - dir * 0.5) + At(uv + dir * 0.5));\n"
+            "  float lw2 = Luma(wide);\n"
+            "  return float4((lw2 < lo || lw2 > hi) ? near : wide, 1);\n"
+            "}\n";
         std::vector<uint8_t> vs, ps;
         std::string err;
         if (!CompileHlsl(kVs, L"vs_6_0", vs, err) || !CompileHlsl(kPs, L"ps_6_0", ps, err))
@@ -1076,6 +1105,12 @@ namespace
         float* cb = (float*)Alloc(fr, 256, 256, cbVa);
         if (!cb) return;
         cb[0] = u; cb[1] = v; cb[2] = cb[3] = 0;
+        // FXAA (launcher setting): texel size of the source for the edge pass.
+        D3D12_RESOURCE_DESC td = tex->GetDesc();
+        cb[4] = 1.0f / float(td.Width);
+        cb[5] = 1.0f / float(td.Height);
+        cb[6] = GetSettings().fxaa ? 1.0f : 0.0f;
+        cb[7] = 0;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvHandle };
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         D3D12_VIEWPORT vp{ area[0], area[1], area[2], area[3], 0, 1 };
@@ -1175,8 +1210,9 @@ uint32_t DrawFrame(ID3D12GraphicsCommandList* list, size_t rtvHandle, uint32_t r
         dummyReady = true;
     }
 
-    // Native resolution: surfaces are rendered at the back buffer's scale (at least 1).
-    float scale = std::max(1.0f, area[2] / kGameWidth);
+    // Native resolution: surfaces are rendered at the back buffer's scale (at least 1), or at the
+    // launcher's render resolution if that is higher (supersampling, filtered down at present).
+    float scale = std::max({ 1.0f, area[2] / kGameWidth, float(std::clamp(GetSettings().renderScale, 1, 4)) });
     if (std::fabs(scale - g_scale) > 0.001f)
     {
         ResetEdram(fr);

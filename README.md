@@ -52,6 +52,31 @@ Useful analysis scripts used during bring-up live in `tools/analysis/` (call gra
 finders, `.pdata` lookups, shader-container scanning); they take the decrypted image
 written by `xexdump --dump-image`.
 
+## Launcher and settings
+
+`Peggle2.exe` opens a launcher first (turn that off on its Play page; hold Shift while starting
+to get it back). Everything is saved to `peggle2_settings.ini` next to the program, a plain-text
+file that can also be edited by hand. Automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`)
+skip it.
+
+- **Play:** install the game from your own Xbox Live Arcade package (the title ID is checked; the
+  files go to `game\` next to the program), full game or trial, launcher at startup.
+- **Display:** fullscreen (F11 or Alt+Enter while playing), monitor, window size (or fit to the
+  screen), keep 16:9 with bars or stretch, VSync.
+- **Graphics:** render resolution (the window's own resolution, or at least 2x-4x supersampled),
+  FXAA, anisotropic texture filtering. (No MSAA: the game draws sprites, which it would not smooth.)
+- **Gameplay:** 60 fps (one logic update per drawn frame; same game speed), F2 frame counter, F3
+  performance overlay, language (given to the game as the console's system language).
+- **Controls:** keyboard bindings (two keys per control), controller button remapping, stick
+  deadzone, axis inversion, vibration and its strength.
+- **Achievements:** the game's achievements with their icons, read from your copy of the game;
+  unlocks are kept in `userdata\achievements.ini` and shown as a pop-up with a chime (or your own
+  `.wav`).
+- **About:** update checks against this repository's GitHub releases (ask / automatic / off,
+  "Check now"; only the port's own files are replaced), buttons for the save, game, log and crash
+  folders and the settings file, reset all settings. Crashes write `crashes\crash-<time>.txt` and
+  a minidump.
+
 ## Status
 
 | Phase | State |

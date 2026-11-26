@@ -95,6 +95,8 @@ using DrawList = std::vector<std::shared_ptr<const DrawRecord>>;
 // GPU thread -> renderer: the draws of one finished frame (at VdSwap's marker).
 // frontBuffer: physical address of the texture VdSwap displays (0 if unknown).
 void RendererSubmitDraws(DrawList&& draws, uint32_t frontBuffer);
+// The title flipped to its next queued frame (hooks.cpp, from its vblank / flip handlers).
+void RendererGuestFlip();
 
 // Host draw execution (draw.cpp), called from the render thread (render.cpp).
 struct ID3D12Device;

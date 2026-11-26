@@ -117,6 +117,7 @@ bool SaveShaderContainer(uint32_t addr, const char* source);
 // translated.
 void StartRenderer();
 void RendererPresent(const GuestTextureInfo* preview);
+void SavePngFile(const char* path, const uint32_t* bgra, unsigned w, unsigned h, unsigned pitchPixels);   // render.cpp
 void GpuHostVblank();       // gpu.cpp: the host display's vblank (drives the guest's at 60 Hz)
 void GpuHostVblankLost();   // gpu.cpp: back to the guest's own 60 Hz timer
 

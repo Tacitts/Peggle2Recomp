@@ -2,6 +2,9 @@
 //
 // Usage: Peggle2.exe [path\to\game]   (default: .\game next to the exe, then ..\game)
 #include "runtime.h"
+#include "launcher.h"
+#include "settings.h"
+#include "achievements.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -241,6 +244,30 @@ void UnwatchGuestWrite()
     g_watchAddr = 0;
 }
 
+// crashes\crash-<time>.dmp (minidump with thread state) and crash-<time>.txt (the log so far)
+// next to the executable, for bug reports.
+static void WriteCrashFiles(PEXCEPTION_POINTERS ep)
+{
+    std::error_code ec;
+    auto dir = PortDir() / "crashes";
+    std::filesystem::create_directories(dir, ec);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[64];
+    snprintf(stamp, sizeof(stamp), "crash-%04u%02u%02u-%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    HANDLE f = CreateFileW((dir / (std::string(stamp) + ".dmp")).wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        MINIDUMP_EXCEPTION_INFORMATION mei{ GetCurrentThreadId(), ep, FALSE };
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          MINIDUMP_TYPE(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory), &mei, nullptr, nullptr);
+        CloseHandle(f);
+    }
+    LogFlush();
+    std::filesystem::copy_file("peggle2_runtime.log", dir / (std::string(stamp) + ".txt"), std::filesystem::copy_options::overwrite_existing, ec);
+    Log("     crash report: %s", (dir / stamp).string().c_str());
+}
+
 static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep)
 {
     auto* rec = ep->ExceptionRecord;
@@ -285,6 +312,7 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep)
 
     // Guest call chain: unwind the host stack and map each frame to its guest function.
     LogGuestChain(*ep->ContextRecord);
+    WriteCrashFiles(ep);
     if (g_logFile) fflush(g_logFile);
     TerminateProcess(GetCurrentProcess(), 3);
     LogFlush();
@@ -307,6 +335,9 @@ static void MissingFunctionTrap(PPCContext& ctx, uint8_t* base)
 }
 
 // ---- Startup ------------------------------------------------------------------------------
+// Modules that add pages/buttons to the launcher (install, updater, achievements) register here.
+void AddLauncherExtras(LauncherInfo& info);
+
 static std::filesystem::path FindGameDir(int argc, char** argv)
 {
     std::vector<std::filesystem::path> candidates;
@@ -711,6 +742,17 @@ int main(int argc, char** argv)
     AddVectoredExceptionHandler(1, CrashHandler);
 
     g_gameDir = FindGameDir(argc, argv);
+    LoadPortSettings();
+    if (LauncherWanted(!g_gameDir.empty()))
+    {
+        LauncherInfo info;
+        info.gameFound = !g_gameDir.empty();
+        info.gameDir = g_gameDir;
+        AddLauncherExtras(info);
+        if (!RunLauncher(info)) { Log("[boot] launcher closed without starting the game"); return 0; }
+        if (g_gameDir.empty()) g_gameDir = FindGameDir(argc, argv);   // installed from the launcher
+    }
+    ApplySettingsToEnvironment();
     if (g_gameDir.empty())
     {
         Log("Could not find game\\Default.xex. Pass the extracted game folder as the first argument.");
@@ -738,6 +780,7 @@ int main(int argc, char** argv)
     CommitGuest(uint32_t(image.base), image.size);
     memcpy(g_base + image.base, image.data.get(), image.size);
     Log("[boot] image mapped at guest 0x%08zX (0x%X bytes), entry 0x%08zX", image.base, image.size, image.entry_point);
+    LoadAchievementsFromImage(xex.data(), xex.size(), image.data.get(), image.base, image.size, XboxLanguageId());
 
     // Indirect-call table: 8 bytes per guest instruction, right after the image.
     uint64_t tableStart = PPC_IMAGE_BASE + PPC_IMAGE_SIZE;

@@ -80,6 +80,29 @@ State at this commit, for whoever continues:
   - The inclusive spike profile (call stacks per sample) shows the loading frames are the title's
     loader (`0x8214F248`/`0x8241FBF0` -> `0x8238EE90`) and frame step, spread over hundreds of
     functions, with zlib (`0x82500300`) on thread 11 at the same time.
+- **Flip pacing (2026-11-26).** The renderer now presents frames on the title's own flips: the
+  flip counter at D3D device +16976 is watched in hooks on the vblank handler (`0x8261EF88`) and
+  the flip-request handler (`0x8261F0B8`); each increase shows the next submitted draw list, so
+  frames reach the screen at the cadence the title chose (swap interval 2 from the last flip)
+  even when the game finishes them in bursts. The title's tear window (5% of a vblank, after which
+  a late frame waits a whole vblank) is widened to 100%: our output is always vsynced, so that
+  wait only added delay (`PEGGLE2_TEAR_WINDOW=5` restores it, `PEGGLE2_PRESENT=submit` presents
+  on submit). `tools/bench_load.ps1 -Runs 4`: shown frames late by 428 ms per run before (3.8
+  frames over 100 ms), 280 ms with the console's 5% window (1.3), 204 ms now (0.8).
+- **Launcher and settings (2026-11-26)**, as chosen by the owner (all of: launcher, fullscreen /
+  monitor / size, render resolution + FXAA + anisotropic filtering, letterbox/stretch + VSync,
+  60 fps, F2/F3 overlay, trial, language, controller remap, keyboard rebinding, deadzone /
+  invert / vibration, achievements + pop-ups, install from package, updater, crash dumps and
+  folder buttons). See the README's "Launcher and settings". Modules: `settings.cpp`,
+  `launcher.cpp` (Win32), `install.cpp` (STFS, ported from tools/stfs_extract.py),
+  `achievements.cpp` (XDBF from Default.xex: 28 achievements; awards arrive as XGI app 0xFB
+  message 0x000B0008 in xmsg.cpp), `updater.cpp` (WinHTTP, GitHub releases, tar.exe), the
+  overlay and display options in `render.cpp`, controls in `input.cpp`, trial and language in
+  `xam.cpp` / `kernel.cpp` (`ExGetXConfigSetting`, which the game reads at boot). Not verified
+  yet: an achievement actually being awarded in play (the XGI message id is from Xenia's
+  documentation), installing from a real package through the launcher, an update (no releases
+  have been published; publishing one needs a zip with Peggle2.exe and the two DXC DLLs),
+  vibration on a real controller, and the game's own languages (the language list is the console's).
 - **Crash reporting was broken (fixed):** the log-buffering change left `CrashHandler` returning
   before its report, and floating-point traps were never reported. Both fixed; the handler masks
   FP exceptions before formatting its report.

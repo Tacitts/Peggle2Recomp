@@ -1,9 +1,14 @@
-﻿// Controller input (XamInput*). Guest controller 1 is always connected and merges:
+// Controller input (XamInput*). Guest controller 1 is always connected and merges:
 //   - the first connected host XInput controller (same XINPUT_GAMEPAD layout and button bits),
-//   - the keyboard, while a window of this process has focus (see kKeyMap),
+//     with the launcher's button remap, stick deadzone and axis inversion (settings.h),
+//   - the keyboard, while a window of this process has focus (bindings in settings.h),
 //   - PEGGLE2_AUTOPRESS (debug pulses of A/Start).
-// Guest controllers 2-4 are not connected.
+// Guest controllers 2-4 are not connected. Rumble goes to the host controller.
 #include "runtime.h"
+#include "settings.h"
+
+#include <algorithm>
+#include <cmath>
 
 #include <cstdlib>
 #include <mutex>
@@ -15,18 +20,6 @@
 
 namespace
 {
-    // Keyboard -> gamepad. Buttons use the XINPUT_GAMEPAD_* bits.
-    struct KeyButton { int vk; uint16_t button; };
-    constexpr KeyButton kKeyMap[] = {
-        { VK_UP, 0x0001 }, { VK_DOWN, 0x0002 }, { VK_LEFT, 0x0004 }, { VK_RIGHT, 0x0008 },  // D-pad
-        { VK_RETURN, 0x0010 }, { 'P', 0x0010 },                                             // Start
-        { VK_TAB, 0x0020 }, { VK_BACK, 0x0020 },                                            // Back
-        { 'Q', 0x0100 }, { 'E', 0x0200 },                                                   // LB / RB
-        { VK_SPACE, 0x1000 }, { 'Z', 0x1000 },                                              // A (fire / confirm)
-        { VK_ESCAPE, 0x2000 }, { 'X', 0x2000 },                                             // B (back)
-        { 'C', 0x4000 }, { 'V', 0x8000 },                                                   // X / Y
-    };
-    // WASD: left stick (aim), IJKL: right stick, Shift / Ctrl: left / right trigger.
 
     // Set from the game window's WM_KEYDOWN/WM_KEYUP (render.cpp), cleared when it loses focus.
     // g_tapped latches a key-down until the next poll, so a tap shorter than one game frame
@@ -34,18 +27,34 @@ namespace
     std::atomic<bool> g_keys[256], g_tapped[256];
     bool Down(int vk)
     {
-        return vk >= 0 && vk < 256 && (g_keys[vk].load(std::memory_order_relaxed) || g_tapped[vk].load(std::memory_order_relaxed));
+        return vk > 0 && vk < 256 && (g_keys[vk].load(std::memory_order_relaxed) || g_tapped[vk].load(std::memory_order_relaxed));
     }
-    int16_t Axis(int neg, int pos) { return int16_t((Down(pos) ? 32767 : 0) - (Down(neg) ? 32767 : 0)); }
-
     // Larger magnitude wins per axis, so keyboard and controller can be used together.
     int16_t MergeAxis(int16_t a, int16_t b) { return std::abs(int(a)) >= std::abs(int(b)) ? a : b; }
+
+    int16_t Invert(int16_t v) { return v == -32768 ? int16_t(32767) : int16_t(-v); }
+
+    // Radial deadzone on one stick: inside it reads as centred, outside it is rescaled so the
+    // stick still reaches full travel.
+    void ApplyDeadzone(int16_t& x, int16_t& y, int percent)
+    {
+        if (percent <= 0) return;
+        double fx = x / 32767.0, fy = y / 32767.0, m = std::sqrt(fx * fx + fy * fy), dz = percent / 100.0;
+        if (m <= dz) { x = y = 0; return; }
+        double k = std::min(1.0, (m - dz) / (1.0 - dz)) / m;
+        x = int16_t(std::clamp(fx * k * 32767.0, -32768.0, 32767.0));
+        y = int16_t(std::clamp(fy * k * 32767.0, -32768.0, 32767.0));
+    }
+
+    // Host controller in use (-1: none). Polling a disconnected slot is slow, so only re-scan
+    // for a controller every 2 s.
+    std::atomic<int> g_slot{ -1 };
 
     XINPUT_GAMEPAD ReadHostPad()
     {
         XINPUT_GAMEPAD pad{};
-        // Polling a disconnected slot is slow, so only re-scan for a controller every 2 s.
-        static int slot = -1;
+        const Settings& set = GetSettings();
+        int slot = g_slot.load();
         static ULONGLONG nextScan = 0;
         XINPUT_STATE st{};
         if (slot >= 0 && XInputGetState(slot, &st) == ERROR_SUCCESS)
@@ -58,15 +67,37 @@ namespace
             for (int i = 0; i < 4; i++)
                 if (XInputGetState(i, &st) == ERROR_SUCCESS) { slot = i; pad = st.Gamepad; break; }
             if (slot != prev) Log("[input] host controller %s", slot >= 0 ? "connected" : "not found");
+            g_slot = slot;
         }
 
-        for (auto& k : kKeyMap) if (Down(k.vk)) pad.wButtons |= k.button;
-        pad.sThumbLX = MergeAxis(pad.sThumbLX, Axis('A', 'D'));
-        pad.sThumbLY = MergeAxis(pad.sThumbLY, Axis('S', 'W'));
-        pad.sThumbRX = MergeAxis(pad.sThumbRX, Axis('J', 'L'));
-        pad.sThumbRY = MergeAxis(pad.sThumbRY, Axis('K', 'I'));
-        if (Down(VK_SHIFT)) pad.bLeftTrigger = 255;
-        if (Down(VK_CONTROL)) pad.bRightTrigger = 255;
+        // Controller: remap buttons (game button i is driven by host buttons buttonMap[i]),
+        // deadzone, inversion.
+        uint16_t host = pad.wButtons, mapped = 0;
+        for (int i = 0; i < 16; i++) if (host & set.buttonMap[i]) mapped |= uint16_t(1u << i);
+        pad.wButtons = mapped;
+        ApplyDeadzone(pad.sThumbLX, pad.sThumbLY, set.deadzone);
+        ApplyDeadzone(pad.sThumbRX, pad.sThumbRY, set.deadzone);
+        if (set.invertLX) pad.sThumbLX = Invert(pad.sThumbLX);
+        if (set.invertLY) pad.sThumbLY = Invert(pad.sThumbLY);
+        if (set.invertRX) pad.sThumbRX = Invert(pad.sThumbRX);
+        if (set.invertRY) pad.sThumbRY = Invert(pad.sThumbRY);
+
+        // Keyboard: two bindings per control.
+        int axis[7] = {};   // index by KeyControl::axis
+        for (int i = 0; i < kKeyControlCount; i++)
+        {
+            const KeyControl& c = kKeyControls[i];
+            if (!Down(set.keys[i][0]) && !Down(set.keys[i][1])) continue;
+            if (c.button) pad.wButtons |= c.button;
+            else axis[c.axis] += c.dir;
+        }
+        auto full = [](int d) { return int16_t(d > 0 ? 32767 : d < 0 ? -32767 : 0); };
+        pad.sThumbLX = MergeAxis(pad.sThumbLX, full(axis[1]));
+        pad.sThumbLY = MergeAxis(pad.sThumbLY, full(axis[2]));
+        pad.sThumbRX = MergeAxis(pad.sThumbRX, full(axis[3]));
+        pad.sThumbRY = MergeAxis(pad.sThumbRY, full(axis[4]));
+        if (axis[5] > 0) pad.bLeftTrigger = 255;
+        if (axis[6] > 0) pad.bRightTrigger = 255;
         for (auto& t : g_tapped) t.store(false, std::memory_order_relaxed);
         return pad;
     }
@@ -143,10 +174,23 @@ IMPORT(XamInputGetState)
     ctx.r3.u64 = 0;
 }
 
-// u32 XamInputSetState(u32 userIndex, u32 flags, X_INPUT_VIBRATION*): rumble ignored
+// u32 XamInputSetState(u32 userIndex, u32 flags, X_INPUT_VIBRATION*): rumble to the host
+// controller. X_INPUT_VIBRATION: u16 left motor, u16 right motor.
 IMPORT(XamInputSetState)
 {
-    ctx.r3.u64 = (ctx.r3.u32 == 0 || ctx.r3.u32 == 0xFF) ? 0 : X_ERROR_DEVICE_NOT_CONNECTED;
+    uint32_t user = ctx.r3.u32, vib = ctx.r5.u32;
+    if (user != 0 && user != 0xFF) { ctx.r3.u64 = X_ERROR_DEVICE_NOT_CONNECTED; return; }
+    int slot = g_slot.load();
+    if (vib && slot >= 0)
+    {
+        const Settings& s = GetSettings();
+        int pct = s.vibration ? s.vibrationStrength : 0;
+        XINPUT_VIBRATION v{};
+        v.wLeftMotorSpeed = WORD(uint32_t(Load16(vib + 0)) * uint32_t(pct) / 100);
+        v.wRightMotorSpeed = WORD(uint32_t(Load16(vib + 2)) * uint32_t(pct) / 100);
+        XInputSetState(DWORD(slot), &v);
+    }
+    ctx.r3.u64 = 0;
 }
 
 // u32 XamInputGetCapabilities(u32 userIndex, u32 flags, X_INPUT_CAPABILITIES* caps)

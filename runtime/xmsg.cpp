@@ -7,8 +7,11 @@
 // Message layouts follow Xenia's documentation of the XMP app (big-endian u32 fields).
 // Other apps' messages complete successfully without doing anything.
 #include "runtime.h"
+#include "achievements.h"
 
+#include <algorithm>
 #include <mutex>
+#include <vector>
 
 namespace
 {
@@ -72,9 +75,32 @@ namespace
         }
     }
 
+    // XGI app (0xFB): XUserWriteAchievements arrives as message 0x000B0008 with a buffer
+    // { u32 count, u32 achievements } -> count x { u32 userIndex, u32 achievementId }.
+    constexpr uint32_t kAppXgi = 0xFB, kXgiWriteAchievements = 0x000B0008;
+
     uint32_t Dispatch(uint32_t app, uint32_t message, uint32_t buf)
     {
         if (app == kAppXmp) return XmpMessage(message, buf);
+        if (app == kAppXgi && message == kXgiWriteAchievements && buf)
+        {
+            uint32_t count = Load32(buf), list = Load32(buf + 4);
+            for (uint32_t i = 0; i < count && i < 64 && list; i++) AwardAchievement(Load32(list + i * 8 + 4));
+            return X_E_SUCCESS;
+        }
+        // Everything else succeeds without doing anything; log each kind once.
+        static std::mutex seenLock;
+        static std::vector<uint64_t> seen;
+        {
+            std::lock_guard<std::mutex> g(seenLock);
+            uint64_t key = uint64_t(app) << 32 | message;
+            if (std::find(seen.begin(), seen.end(), key) == seen.end() && seen.size() < 64)
+            {
+                seen.push_back(key);
+                Log("[xmsg] app 0x%X message 0x%08X: not handled (buffer 0x%08X: %08X %08X %08X %08X)", app, message, buf,
+                    buf ? Load32(buf) : 0, buf ? Load32(buf + 4) : 0, buf ? Load32(buf + 8) : 0, buf ? Load32(buf + 12) : 0);
+            }
+        }
         return X_E_SUCCESS;
     }
 }

@@ -1,6 +1,7 @@
 // Kernel (xboxkrnl.exe) and XAM imports: the first, minimal set.
 // Everything not implemented here gets a logging stub from tools/gen_imports.py.
 #include "runtime.h"
+#include "settings.h"
 
 #include <chrono>
 #include <map>
@@ -224,6 +225,67 @@ void InitImports(const uint8_t* xexFile, size_t xexSize)
             }
         }).detach();
     }
+}
+
+// ---- System settings (XConfig) ---------------------------------------------------------------
+// ExGetXConfigSetting(u16 category, u16 setting, void* buffer, u16 size, u16* requiredSize).
+// User category (3): language from the launcher (or Windows), plus the usual defaults.
+namespace
+{
+    // Xbox 360 language ids: 1 en, 2 ja, 3 de, 4 fr, 5 es, 6 it, 7 ko, 8 zh (traditional),
+    // 9 pt, 10 zh (simplified), 11 pl, 12 ru.
+    uint32_t XboxLanguage()
+    {
+        static const struct { const char* code; uint32_t id; } table[] = {
+            { "en", 1 }, { "ja", 2 }, { "de", 3 }, { "fr", 4 }, { "es", 5 }, { "it", 6 }, { "ko", 7 },
+            { "zh", 8 }, { "pt", 9 }, { "pl", 11 }, { "ru", 12 },
+        };
+        std::string want = GetSettings().language;
+        if (want.empty() || want == "auto")
+        {
+            wchar_t name[LOCALE_NAME_MAX_LENGTH] = L"";
+            GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+            want.clear();
+            for (int i = 0; i < 2 && name[i]; i++) want += char(name[i]);
+        }
+        for (auto& t : table) if (want == t.code) return t.id;
+        return 1;
+    }
+}
+
+uint32_t XboxLanguageId() { return XboxLanguage(); }   // achievements.h
+
+IMPORT(ExGetXConfigSetting)
+{
+    uint16_t category = uint16_t(ctx.r3.u32), setting = uint16_t(ctx.r4.u32);
+    uint32_t buffer = ctx.r5.u32, size = ctx.r6.u32 & 0xFFFF, required = ctx.r7.u32;
+    uint32_t value = 0, length = 4;
+    bool known = true;
+    if (category == 3)   // XCONFIG_USER_CATEGORY
+    {
+        switch (setting)
+        {
+        case 0x0009: value = XboxLanguage(); break;   // language
+        case 0x000A: value = 0x00000007; break;       // video flags: widescreen, 720p, 1080i
+        case 0x000C: value = 0x00000040; break;       // retail flags
+        case 0x000E: value = 0x00000067; length = 1; break;   // country: United States
+        default: known = false;
+        }
+    }
+    else if (category == 2 && setting == 0x0002)      // XCONFIG_SECURED: AV region (NTSC-M)
+        value = 0x00001000;
+    else
+        known = false;
+    static std::atomic<int> logged{ 0 };
+    if (logged++ < 8) Log("[xconfig] ExGetXConfigSetting(category %u, setting 0x%X)%s", category, setting, known ? "" : ": not provided");
+    if (!known) { ctx.r3.u64 = 0xC00000F0; return; }   // STATUS_INVALID_PARAMETER_2
+    if (required) Store16(required, uint16_t(length));
+    if (buffer && size >= length)
+    {
+        if (length == 1) Store8(buffer, uint8_t(value));
+        else Store32(buffer, value);
+    }
+    ctx.r3.u64 = 0;
 }
 
 // ---- Debug / misc ----------------------------------------------------------------------------

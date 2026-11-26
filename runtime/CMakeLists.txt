@@ -46,9 +46,29 @@ add_executable(Peggle2
     draw.cpp
     xenos_shader.cpp
     zlib_native.cpp
+    settings.cpp
+    launcher.cpp
+    launcher_extras.cpp
+    achievements.cpp
+    install.cpp
+    updater.cpp
     generated/import_stubs.cpp
 )
 target_include_directories(Peggle2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+
+# Port version for the updater and the launcher: the nearest git tag (or the commit), "dev" without git.
+find_package(Git QUIET)
+set(PEGGLE2_VERSION "dev")
+if (GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE PEGGLE2_GIT_VERSION
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE PEGGLE2_GIT_RESULT)
+    if (PEGGLE2_GIT_RESULT EQUAL 0 AND PEGGLE2_GIT_VERSION)
+        set(PEGGLE2_VERSION "${PEGGLE2_GIT_VERSION}")
+    endif()
+endif()
+set_source_files_properties(updater.cpp PROPERTIES COMPILE_DEFINITIONS "PEGGLE2_VERSION=\"${PEGGLE2_VERSION}\"")
+message(STATUS "Peggle 2 port version: ${PEGGLE2_VERSION}")
 target_compile_definitions(Peggle2 PRIVATE NOMINMAX)
 target_compile_options(Peggle2 PRIVATE /clang:-march=sandybridge -Wno-unused-parameter /Z7)
 set_source_files_properties(xenos_shader.cpp PROPERTIES COMPILE_OPTIONS "/FI${XENOS}/XenosRecomp/pch.h;-Wno-switch")

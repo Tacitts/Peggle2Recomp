@@ -1,6 +1,7 @@
 // XAM (system services) imports: notifications, the signed-in profile, profile settings,
 // licensing.
 #include "runtime.h"
+#include "settings.h"
 
 #include <deque>
 #include <fstream>
@@ -141,10 +142,14 @@ IMPORT(XamUserGetDeviceContext)
     ctx.r3.u64 = ctx.r3.u32 == 0 ? X_ERROR_SUCCESS : X_ERROR_NO_SUCH_USER;
 }
 
-// u32 XamContentGetLicenseMask(u32* mask, XOVERLAPPED*): full game
+// u32 XamContentGetLicenseMask(u32* mask, XOVERLAPPED*): full game, or no license bits for the
+// XBLA trial ([gameplay] trial in the launcher).
 IMPORT(XamContentGetLicenseMask)
 {
-    if (ctx.r3.u32) Store32(ctx.r3.u32, 0xFFFFFFFF);
+    bool trial = GetSettings().trial;
+    static std::atomic<bool> logged{ false };
+    if (!logged.exchange(true)) Log("[xam] license: %s", trial ? "trial" : "full game");
+    if (ctx.r3.u32) Store32(ctx.r3.u32, trial ? 0 : 0xFFFFFFFF);
     ctx.r3.u64 = CompleteOverlapped(ctx.r4.u32, X_ERROR_SUCCESS);
 }
 

@@ -7,11 +7,14 @@
 // The title shows game frames, FPS and the previewed texture.
 #include "runtime.h"
 #include "frame_stats.h"
+#include "settings.h"
+#include "achievements.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -351,12 +354,123 @@ namespace
     // Translated draws: the latest complete frame from the GPU thread (RendererSubmitDraws).
     bool g_drawReady = false;
     std::mutex g_drawsLock;
-    DrawList g_latestDraws;
+    // Flip pacing (under g_drawsLock): every swap the title requests ends in exactly one flip, in
+    // order, so submitted draw lists wait in a queue and each guest flip shows the next one, at
+    // the cadence the title chose (swap interval 2 from the previous flip, 5% tear window).
+    // Before the first flip is seen (or with PEGGLE2_PRESENT=submit) lists are shown at once.
+    struct Submitted { uint64_t serial; uint32_t front; DrawList draws; };
+    std::deque<Submitted> g_recent;     // submitted, not yet flipped
+    DrawList g_latestDraws;             // the list to present next
     uint32_t g_latestFront = 0;
+    uint64_t g_latestSerial = 0;
+    bool g_flipPacing = false;          // a guest flip has been seen
+    uint32_t g_pendingFlips = 0;        // flips that came before their draws
+    uint64_t g_flipsMatched = 0, g_flipsEarly = 0, g_flipsUnmatched = 0;
+    const bool g_presentOnSubmit = [] { const char* v = getenv("PEGGLE2_PRESENT"); return v && strcmp(v, "submit") == 0; }();
     uint32_t g_lastExecuted = 0;
     const bool g_forcePreview = getenv("PEGGLE2_PREVIEW") != nullptr;
 
     std::atomic<bool> g_screenshotRequested{ false };   // F12 (see SaveScreenshot)
+
+    // ---- F2 frame counter / F3 performance overlay / achievement pop-up ----------------------
+    // Text drawn with GDI into a small bitmap (two slots: 0 the counter, 1 the pop-up) and copied
+    // into the back buffer: the counter top-left, the pop-up at the bottom centre.
+    std::atomic<bool> g_showFps{ false }, g_showPerf{ false };
+    constexpr UINT kOverlayW = 512, kOverlayH = 96, kOverlayPitch = kOverlayW * 4;
+    ID3D12Resource* g_overlayUpload[kBuffers] = {};
+    uint8_t* g_overlayPtr[kBuffers] = {};
+    HDC g_overlayDc = nullptr;
+    HBITMAP g_overlayBmp = nullptr;
+    uint32_t* g_overlayBits = nullptr;
+    HFONT g_overlayFont = nullptr;
+    struct OverlayStats
+    {
+        std::chrono::steady_clock::time_point windowStart{}, lastNew{};
+        uint32_t newFrames = 0, late = 0;          // this second
+        double worstMs = 0, workSum = 0;
+        uint32_t workN = 0;
+        double fps = 0, shownWorst = 0, workAvg = 0;   // last completed second
+        uint32_t lateLastSec = 0;
+        std::deque<uint32_t> lateHistory;          // late frames per second, last 10 s
+    } g_ov;
+
+    // Rows of text, each with a colour; returns the height used.
+    UINT DrawOverlayText(const std::vector<std::pair<std::string, COLORREF>>& rows, int slot = 0)
+    {
+        if (!g_overlayDc)
+        {
+            g_overlayDc = CreateCompatibleDC(nullptr);
+            BITMAPINFO bi{};
+            bi.bmiHeader = { sizeof(BITMAPINFOHEADER), LONG(kOverlayW), -LONG(kOverlayH * 2), 1, 32, BI_RGB };
+            g_overlayBmp = CreateDIBSection(g_overlayDc, &bi, DIB_RGB_COLORS, (void**)&g_overlayBits, nullptr, 0);
+            SelectObject(g_overlayDc, g_overlayBmp);
+            g_overlayFont = CreateFontW(-18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+            SelectObject(g_overlayDc, g_overlayFont);
+            SetBkMode(g_overlayDc, TRANSPARENT);
+        }
+        UINT h = std::min<UINT>(UINT(rows.size()) * 22 + 8, kOverlayH);
+        int y0 = slot * int(kOverlayH);
+        RECT all{ 0, y0, LONG(kOverlayW), LONG(y0 + h) };
+        HBRUSH bg = CreateSolidBrush(slot ? RGB(30, 30, 30) : RGB(16, 16, 16));
+        FillRect(g_overlayDc, &all, bg);
+        DeleteObject(bg);
+        int y = y0 + 4;
+        UINT w = 0;
+        for (auto& [text, color] : rows)
+        {
+            SetTextColor(g_overlayDc, color);
+            TextOutA(g_overlayDc, 8, y, text.c_str(), int(text.size()));
+            SIZE sz{};
+            GetTextExtentPoint32A(g_overlayDc, text.c_str(), int(text.size()), &sz);
+            w = std::max<UINT>(w, UINT(sz.cx) + 16);
+            y += 22;
+        }
+        GdiFlush();
+        return h | (std::min(w, kOverlayW) << 16);
+    }
+
+    void NoteOverlayFrame(double gapMs, double workMs, bool newFrame)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (g_ov.windowStart.time_since_epoch().count() == 0) g_ov.windowStart = now;
+        g_ov.workSum += workMs;
+        g_ov.workN++;
+        if (newFrame)
+        {
+            g_ov.newFrames++;
+            if (gapMs > 0) g_ov.worstMs = std::max(g_ov.worstMs, gapMs);
+            if (gapMs > 34.5) g_ov.late++;
+        }
+        double el = std::chrono::duration<double>(now - g_ov.windowStart).count();
+        if (el >= 1.0)
+        {
+            g_ov.fps = g_ov.newFrames / el;
+            g_ov.shownWorst = g_ov.worstMs;
+            g_ov.workAvg = g_ov.workN ? g_ov.workSum / g_ov.workN : 0;
+            g_ov.lateLastSec = g_ov.late;
+            g_ov.lateHistory.push_back(g_ov.late);
+            while (g_ov.lateHistory.size() > 10) g_ov.lateHistory.pop_front();
+            g_ov.windowStart = now;
+            g_ov.newFrames = g_ov.late = g_ov.workN = 0;
+            g_ov.worstMs = g_ov.workSum = 0;
+        }
+    }
+
+    // Window placement from the launcher settings: monitor, size (16:9), fullscreen.
+    HMONITOR PickMonitor(int index)
+    {
+        struct Ctx { int want, n; HMONITOR found, primary; } c{ index, 0, nullptr, nullptr };
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
+            auto* c = (Ctx*)lp;
+            MONITORINFO mi{ sizeof(mi) };
+            GetMonitorInfoW(m, &mi);
+            if (mi.dwFlags & MONITORINFOF_PRIMARY) c->primary = m;
+            if (c->n++ == c->want) c->found = m;
+            return TRUE;
+        }, (LPARAM)&c);
+        return c.found ? c.found : c.primary;
+    }
 
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
@@ -381,6 +495,11 @@ namespace
             if (wp == VK_F11 || (wp == VK_RETURN && (lp & (1 << 29))))
             {
                 if (!(lp & (1 << 30))) ToggleFullscreen(hwnd);   // ignore auto-repeat
+                return 0;
+            }
+            if (wp == VK_F2 || wp == VK_F3)   // frame counter / performance overlay
+            {
+                if (!(lp & (1 << 30))) (wp == VK_F2 ? g_showFps : g_showPerf) = !(wp == VK_F2 ? g_showFps : g_showPerf).load();
                 return 0;
             }
             if (wp == VK_F12)   // screenshot (window control, not passed to the game)
@@ -410,11 +529,24 @@ namespace
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.lpszClassName = L"Peggle2Recomp";
         RegisterClassW(&wc);
-        RECT r{ 0, 0, LONG(kWidth), LONG(kHeight) };
+        // Client size: the launcher's choice (16:9), or the largest 16:9 size that fits 85% of the
+        // chosen monitor's work area; centred on that monitor.
+        const Settings& set = GetSettings();
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(PickMonitor(set.monitor), &mi);
+        LONG workW = mi.rcWork.right - mi.rcWork.left, workH = mi.rcWork.bottom - mi.rcWork.top;
+        LONG cw = set.windowWidth > 0 ? set.windowWidth : std::min<LONG>(workW * 85 / 100, workH * 85 / 100 * 16 / 9);
+        cw = std::max<LONG>(cw, 640);
+        LONG ch = cw * 9 / 16;
+        RECT r{ 0, 0, cw, ch };
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        LONG ww = r.right - r.left, wh = r.bottom - r.top;
+        LONG x = mi.rcWork.left + std::max<LONG>(0, (workW - ww) / 2), y = mi.rcWork.top + std::max<LONG>(0, (workH - wh) / 2);
         g_hwnd = CreateWindowW(wc.lpszClassName, L"Peggle 2 (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                               CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+                               x, y, ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd) { Log("[render] CreateWindow failed (%lu)", GetLastError()); return false; }
+        g_showFps = set.fpsCounter;
+        g_showPerf = set.perfOverlay;
 
         IDXGIFactory4* factory = nullptr;
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) { Log("[render] DXGI factory failed"); return false; }
@@ -469,6 +601,9 @@ namespace
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_upload[i]));
             g_upload[i]->Map(0, nullptr, (void**)&g_uploadPtr[i]);
+            rd.Width = UINT64(kOverlayPitch) * kOverlayH * 2;
+            g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_overlayUpload[i]));
+            g_overlayUpload[i]->Map(0, nullptr, (void**)&g_overlayPtr[i]);
         }
         g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_allocators[0], nullptr, IID_PPV_ARGS(&g_list));
         g_list->Close();
@@ -644,7 +779,7 @@ namespace
             std::lock_guard<std::mutex> g(g_drawsLock);
             draws = g_latestDraws;
             front = g_latestFront;
-            g_shownSerial = g_drawSerial;
+            g_shownSerial = g_latestSerial;
         }
         UINT pw = 0, ph = 0;
         if (draws.empty()) PreparePreview(i, preview, pw, ph);
@@ -677,6 +812,7 @@ namespace
             // Letterboxed game area in back-buffer pixels.
             float scale = std::min(float(g_bbW) / kWidth, float(g_bbH) / kHeight);
             float area[4] = { (g_bbW - kWidth * scale) * 0.5f, (g_bbH - kHeight * scale) * 0.5f, kWidth * scale, kHeight * scale };
+            if (GetSettings().stretch) { area[0] = area[1] = 0; area[2] = float(g_bbW); area[3] = float(g_bbH); }   // fill, no bars
             g_lastExecuted = DrawFrame(g_list, rtv.ptr, g_bbW, g_bbH, area, draws, front, i);
             snprintf(g_previewDesc, sizeof(g_previewDesc), "%u/%zu draws", g_lastExecuted, draws.size());
             if (frame == 600 || frame == 1200 || frame == 2400 || frame == 3600)
@@ -703,6 +839,67 @@ namespace
         {
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        }
+        // F2 / F3 overlay: copied over the top-left corner of the frame.
+        if (g_showFps || g_showPerf)
+        {
+            char line[160];
+            std::vector<std::pair<std::string, COLORREF>> rows;
+            snprintf(line, sizeof(line), "%.0f fps", g_ov.fps);
+            rows.push_back({ line, g_ov.fps >= 29.5 || g_ov.fps >= 59.5 ? RGB(120, 230, 120) : RGB(255, 200, 80) });
+            if (g_showPerf)
+            {
+                uint32_t late10 = 0;
+                for (uint32_t n : g_ov.lateHistory) late10 += n;
+                snprintf(line, sizeof(line), "worst frame %.1f ms   render %.1f ms", g_ov.shownWorst, g_ov.workAvg);
+                rows.push_back({ line, RGB(230, 230, 230) });
+                snprintf(line, sizeof(line), "late frames: %u last second, %u last 10 s", g_ov.lateLastSec, late10);
+                rows.push_back({ line, late10 ? RGB(255, 200, 80) : RGB(230, 230, 230) });
+            }
+            UINT packed = DrawOverlayText(rows), oh = packed & 0xFFFF, ow = packed >> 16;
+            if (ow > g_bbW) ow = g_bbW;
+            if (oh > g_bbH) oh = g_bbH;
+            for (UINT y = 0; y < oh; y++) memcpy(g_overlayPtr[i] + size_t(y) * kOverlayPitch, g_overlayBits + size_t(y) * kOverlayW, size_t(ow) * 4);
+            if (b.Transition.StateBefore != D3D12_RESOURCE_STATE_COPY_DEST)
+            {
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_list->ResourceBarrier(1, &b);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            }
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = g_backBuffers[i];
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = g_overlayUpload[i];
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_B8G8R8A8_UNORM, kOverlayW, kOverlayH * 2, 1, kOverlayPitch };
+            D3D12_BOX box{ 0, 0, 0, ow, oh, 1 };
+            UINT at = std::min<UINT>(12, g_bbW - ow);
+            g_list->CopyTextureRegion(&dst, at, std::min<UINT>(12, g_bbH - oh), 0, &src, &box);
+        }
+        // Achievement pop-up: bottom centre, for a few seconds.
+        if (std::string title, detail; CurrentAchievementPopup(title, detail))
+        {
+            UINT packed = DrawOverlayText({ { title, RGB(140, 220, 110) }, { detail, RGB(240, 240, 240) } }, 1);
+            UINT ph2 = std::min<UINT>(packed & 0xFFFF, g_bbH), pw2 = std::min<UINT>(std::max<UINT>(packed >> 16, 320), std::min(kOverlayW, g_bbW));
+            for (UINT y = 0; y < ph2; y++)
+                memcpy(g_overlayPtr[i] + size_t(kOverlayH + y) * kOverlayPitch, g_overlayBits + size_t(kOverlayH + y) * kOverlayW, size_t(pw2) * 4);
+            if (b.Transition.StateBefore != D3D12_RESOURCE_STATE_COPY_DEST)
+            {
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_list->ResourceBarrier(1, &b);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            }
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = g_backBuffers[i];
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = g_overlayUpload[i];
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_B8G8R8A8_UNORM, kOverlayW, kOverlayH * 2, 1, kOverlayPitch };
+            D3D12_BOX box{ 0, kOverlayH, 0, pw2, kOverlayH + ph2, 1 };
+            UINT px = (g_bbW - pw2) / 2, py = g_bbH > ph2 + 40 ? g_bbH - ph2 - 40 : 0;
+            g_list->CopyTextureRegion(&dst, px, py, 0, &src, &box);
         }
         bool shot = g_screenshotRequested.exchange(false);
         if (auto it = std::find(g_screenshotFrames.begin(), g_screenshotFrames.end(), frame); it != g_screenshotFrames.end())
@@ -745,7 +942,7 @@ namespace
         g_list->Close();
         ID3D12CommandList* lists[] = { g_list };
         g_queue->ExecuteCommandLists(1, lists);
-        g_swapChain->Present(1, 0);
+        g_swapChain->Present(GetSettings().vsync ? 1 : 0, 0);
         g_fenceValues[i] = g_nextFence;
         g_queue->Signal(g_fence, g_nextFence++);
         if (readback)
@@ -821,6 +1018,7 @@ namespace
         NameHostThread("render");
         if (!CreateWindowAndDevice()) return;
         g_ready = true;
+        if (GetSettings().fullscreen) ToggleFullscreen(g_hwnd);
         std::thread(VblankThread).detach();
         auto lastTitle = std::chrono::steady_clock::now();
         uint64_t lastFrames = 0;
@@ -851,7 +1049,13 @@ namespace
             auto workStart = std::chrono::steady_clock::now();
             PresentFrame(frame, hasPreview ? &preview : nullptr);
             auto now = std::chrono::steady_clock::now();
-            g_renderWorkHist.Add(std::chrono::duration<double, std::milli>(now - workStart).count());
+            double workMs = std::chrono::duration<double, std::milli>(now - workStart).count();
+            g_renderWorkHist.Add(workMs);
+            {
+                bool isNew = frame != lastStatFrame && g_shownSerial != lastSerial;
+                double gapMs = isNew && lastNew.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(now - lastNew).count() : 0;
+                NoteOverlayFrame(gapMs, workMs, isNew);
+            }
             if (frame != lastStatFrame)   // a present the game asked for
             {
                 lastStatFrame = frame;
@@ -880,6 +1084,13 @@ namespace
                 Log("[frames] %s; %llu repeated a frame, %llu frames never shown", g_newFrameHist.TakeLine("new frames shown").c_str(),
                     (unsigned long long)dupPresents, (unsigned long long)skippedLists);
                 Log("[frames] %s", g_renderWorkHist.TakeLine("render thread per present").c_str());
+                {
+                    std::lock_guard<std::mutex> g(g_drawsLock);
+                    if (g_flipPacing)
+                        Log("[frames] guest flips: %llu showed a queued frame, %llu came before their draws, %llu frames superseded",
+                            (unsigned long long)g_flipsMatched, (unsigned long long)g_flipsEarly, (unsigned long long)g_flipsUnmatched);
+                    g_flipsMatched = g_flipsEarly = g_flipsUnmatched = 0;
+                }
                 dupPresents = skippedLists = 0;
             }
             if (now - lastTitle > std::chrono::seconds(1))
@@ -900,13 +1111,64 @@ void RendererSubmitDraws(DrawList&& draws, uint32_t frontBuffer)
 {
     {
     std::lock_guard<std::mutex> g(g_drawsLock);
-    g_latestDraws = std::move(draws);
-    g_latestFront = frontBuffer;
-    g_drawSerial++;
+    uint64_t serial = ++g_drawSerial;
+    bool present = false;
+    if (!g_flipPacing || g_presentOnSubmit)
+        present = true;                                   // no flips seen yet: show it now
+    else if (g_pendingFlips)
+    {
+        present = true;                                   // the title already flipped to it
+        g_pendingFlips--;
+        g_flipsEarly++;
+    }
+    if (present)
+    {
+        g_latestDraws = std::move(draws);
+        g_latestFront = frontBuffer;
+        g_latestSerial = serial;
+    }
+    else
+    {
+        g_recent.push_back({ serial, frontBuffer, std::move(draws) });
+        // Lost track (more frames than flips): keep the newest two, the rest were superseded.
+        while (g_recent.size() > 3) { g_recent.pop_front(); g_flipsUnmatched++; }
+    }
+    if (!present) return;
     }
     // With draw translation, a frame is presented when its draws are complete (here, on the GPU
     // thread), not at VdSwap, which runs ahead of the GPU thread and showed the old list again.
     if (g_drawReady && !g_forcePreview)
+    {
+        std::lock_guard<std::mutex> lk(g_presentLock);
+        g_requested++;
+    }
+    g_presentCv.notify_one();
+}
+
+void RendererGuestFlip()
+{
+    if (g_presentOnSubmit || !g_drawReady || g_forcePreview) return;
+    {
+        std::lock_guard<std::mutex> g(g_drawsLock);
+        if (!g_flipPacing)
+        {
+            g_flipPacing = true;
+            g_recent.clear();
+            Log("[render] presenting on the title's flips (PEGGLE2_PRESENT=submit presents on submit)");
+            return;   // the frame this flip shows was already presented on submit
+        }
+        if (g_recent.empty())
+        {
+            if (g_pendingFlips < 2) g_pendingFlips++;   // its draws are still on the way
+            return;
+        }
+        Submitted s = std::move(g_recent.front());
+        g_recent.pop_front();
+        g_latestDraws = std::move(s.draws);
+        g_latestFront = s.front;
+        g_latestSerial = s.serial;
+        g_flipsMatched++;
+    }
     {
         std::lock_guard<std::mutex> lk(g_presentLock);
         g_requested++;
@@ -921,6 +1183,11 @@ void StartRenderer()
 
 // Called from VdSwap: one game frame finished. A frame without a usable texture keeps showing
 // the previous preview, so short loading frames don't flicker.
+void SavePngFile(const char* path, const uint32_t* bgra, unsigned w, unsigned h, unsigned pitchPixels)
+{
+    WritePng(path, bgra, w, h, pitchPixels);
+}
+
 void RendererPresent(const GuestTextureInfo* preview)
 {
     {
