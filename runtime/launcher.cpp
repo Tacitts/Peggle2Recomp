@@ -46,8 +46,11 @@ namespace
 {
     // Layout (96-dpi units): header art across the top, page sidebar on the left, pages on the right.
     constexpr int kW = 980, kH = 730, kHeaderH = 250, kSideW = 190;
-    constexpr int kPageX = kSideW + 24, kPageY = kHeaderH + 20, kPageW = kW - kPageX - 20, kPageH = kH - kPageY - 16;
-    enum : int { kIdPlay = 1, kIdQuit = 2, kIdNav = 10, kIdFirst = 100 };
+    constexpr int kPageX = kSideW + 24, kPageY = kHeaderH + 20, kPageW = kW - kPageX - 20, kPageH = kH - kPageY - 44;
+    enum : int { kIdPlay = 1, kIdQuit = 2, kIdSave = 3, kIdNav = 10, kIdFirst = 100 };
+    const COLORREF kReady = RGB(30, 110, 62), kReadyEdge = RGB(52, 150, 88), kMissing = RGB(120, 78, 20), kMissingEdge = RGB(176, 118, 36);
+    HWND g_card = nullptr, g_installBtn = nullptr;   // Play page: status card, install button
+    ULONGLONG g_savedUntil = 0;                       // "Settings saved" note in the hint line
 
     // Colours: dark greys, with the orange and blue of the game's logo as accents.
     const COLORREF kBg = RGB(24, 24, 30), kSide = RGB(17, 17, 22), kPanel = RGB(24, 24, 30), kText = RGB(236, 236, 242),
@@ -65,6 +68,7 @@ namespace
     bool g_play = false;
     LauncherInfo g_info;
     void StartTitleCapture(bool force);   // below
+    void OnInstalled();                   // below: refresh after installing the game
     std::vector<HWND> g_notes;            // secondary text (muted colour)
 
     int S(int v) { return MulDiv(v, g_dpi, 96); }   // scale 96-dpi layout units
@@ -73,6 +77,7 @@ namespace
     struct Binding { HWND h; std::function<void()> refresh, apply; };
     std::vector<Binding> g_bindings;
     std::vector<HWND> g_checks;   // owner-drawn checkboxes
+    std::vector<HWND> g_lists;    // list views (custom-drawn rows)
     std::vector<std::function<void(int)>> g_commands;   // id - kIdFirst -> handler(notification)
 
     int NewId(std::function<void(int)> fn)
@@ -224,12 +229,73 @@ namespace
         }
     }
 
+    void FillSolid(HDC dc, RECT r, COLORREF c);   // below
+    // Column headings of a list: drawn here (the list view forwards its header's custom-draw).
+    LRESULT CALLBACK ListSubclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)
+    {
+        if (msg == WM_NOTIFY && ((NMHDR*)lp)->hwndFrom == ListView_GetHeader(h) && ((NMHDR*)lp)->code == NM_CUSTOMDRAW)
+        {
+            auto* cd = (NMCUSTOMDRAW*)lp;
+            if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+            if (cd->dwDrawStage == CDDS_POSTPAINT)
+            {
+                // The strip right of the last column (the theme paints it white).
+                HWND hdr = cd->hdr.hwndFrom;
+                RECT cr, last{};
+                GetClientRect(hdr, &cr);
+                int n = Header_GetItemCount(hdr);
+                if (n > 0) Header_GetItemRect(hdr, n - 1, &last);
+                if (last.right < cr.right) FillSolid(cd->hdc, RECT{ last.right, cr.top, cr.right, cr.bottom }, kSide);
+                return CDRF_DODEFAULT;
+            }
+            if (cd->dwDrawStage == CDDS_ITEMPREPAINT)
+            {
+                FillSolid(cd->hdc, cd->rc, kSide);
+                RECT edge{ cd->rc.right - 1, cd->rc.top + S(4), cd->rc.right, cd->rc.bottom - S(4) };
+                FillSolid(cd->hdc, edge, kEdge);
+                wchar_t text[64] = L"";
+                HDITEMW hi{};
+                hi.mask = HDI_TEXT;
+                hi.pszText = text;
+                hi.cchTextMax = 64;
+                Header_GetItem(cd->hdr.hwndFrom, int(cd->dwItemSpec), &hi);
+                SetBkMode(cd->hdc, TRANSPARENT);
+                SetTextColor(cd->hdc, kMuted);
+                HGDIOBJ of = SelectObject(cd->hdc, g_font);
+                RECT tr = cd->rc;
+                tr.left += S(8);
+                DrawTextW(cd->hdc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                SelectObject(cd->hdc, of);
+                return CDRF_SKIPDEFAULT;
+            }
+        }
+        if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, ListSubclass, 1);
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
+    // Rows of a list (from the page's WM_NOTIFY): light text on the dark background.
+    LRESULT ListRowColors(NMLVCUSTOMDRAW* cd)
+    {
+        if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+        {
+            bool sel = ListView_GetItemState(cd->nmcd.hdr.hwndFrom, int(cd->nmcd.dwItemSpec), LVIS_SELECTED) & LVIS_SELECTED;
+            cd->clrText = kText;
+            cd->clrTextBk = sel ? kControlHot : kControl;
+            // Selected rows: draw the highlight ourselves (the theme's would bring its own text colour).
+            if (sel) cd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS);
+            return CDRF_NEWFONT;
+        }
+        return CDRF_DODEFAULT;
+    }
+
     HWND MakeList(HWND page, int x, int y, int w, int h, std::vector<std::pair<const wchar_t*, int>> cols)
     {
         HWND lv = Make(page, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, x, y, w, h, NewId(nullptr));
         ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-        SetWindowTheme(lv, L"DarkMode_Explorer", nullptr);
-        SetWindowTheme(ListView_GetHeader(lv), L"DarkMode_ItemsView", nullptr);
+        SetWindowTheme(lv, L"DarkMode_Explorer", nullptr);   // dark scrollbars
+        SetWindowSubclass(lv, ListSubclass, 1, 0);
+        g_lists.push_back(lv);
         ListView_SetBkColor(lv, kControl);
         ListView_SetTextBkColor(lv, kControl);
         ListView_SetTextColor(lv, kText);
@@ -257,12 +323,15 @@ namespace
     {
         HWND p = NewPage();
         Settings& s = GetSettings();
-        Label(p, 0, 0, 600, L"Peggle 2 (recompiled)", true);
-        std::wstring status = g_info.gameFound
-            ? L"Game files: " + g_info.gameDir.wstring()
-            : L"Game files not found. Install them from your own Xbox Live Arcade package (Install from package), "
-              L"or place the extracted files in a folder named \"game\" next to the program.";
-        Note(p, 0, 28, 660, 40, status.c_str());
+        // Status card (owner-drawn): ready to play, or the game files are needed.
+        g_card = Make(p, L"BUTTON", L"", BS_OWNERDRAW, 0, 0, 740, 58);
+        if (g_info.installPackage)
+        {
+            g_installBtn = Button(p, 0, 74, 230, g_info.gameFound ? L"Reinstall from package..." : L"Install from package...",
+                                  [] { if (g_info.installPackage(g_wnd)) OnInstalled(); });
+            Note(p, 246, 72, 494, 36, L"Your own Peggle 2 package from an Xbox 360 (a file with a long hexadecimal name under "
+                                      L"Content\\...\\58411436\\000D0000). You can also drop the file onto this window.");
+        }
         if (g_info.gameFound && Achievements().empty()) LoadAchievements(g_info.gameDir, XboxLanguageId());
         if (!Achievements().empty())
         {
@@ -270,14 +339,12 @@ namespace
             for (auto& a : Achievements()) { total += a.gamerscore; if (a.unlockedAt) { unlocked++; score += a.gamerscore; } }
             wchar_t line[160];
             swprintf(line, 160, L"Achievements: %u of %zu unlocked, %u of %u G", unlocked, Achievements().size(), score, total);
-            Label(p, 0, 52, 660, line);
+            Label(p, 0, 120, 660, line);
         }
-        if (g_info.installPackage)
-            Button(p, 0, 86, 200, L"Install from package...", [] {
-                if (g_info.installPackage(g_wnd)) { g_info.gameFound = true; MessageBoxW(g_wnd, L"Installed. Press Play to start.", L"Peggle 2", MB_ICONINFORMATION); }
-            });
-        Combo<bool>(p, 0, 132, 120, 200, L"Game mode:", &s.trial, { { L"Full game", false }, { L"Trial", true } });
-        Note(p, 0, 176, 660, 140,
+        Combo<bool>(p, 0, 150, 120, 200, L"Edition:", &s.trial, { { L"Full game", false }, { L"Trial", true } });
+        Note(p, 330, 148, 410, 36, L"The full game is in your package. Trial plays it as the Xbox Live Arcade demo "
+                                   L"(XBLA games shipped as trials that unlocked when bought).");
+        Note(p, 0, 196, 740, 140,
              L"Controller: A or Start plays, B quits, LB / RB switch pages.\n\n"
              L"Keys while playing: F11 or Alt+Enter fullscreen, F2 frame counter, F3 performance overlay, F12 screenshot.\n\n"
              L"Keyboard: arrows or WASD aim, Space fires, Enter pauses, Esc goes back (rebind on the Controls page).");
@@ -672,8 +739,10 @@ namespace
 
     bool IsCheck(HWND h) { return std::find(g_checks.begin(), g_checks.end(), h) != g_checks.end(); }
 
+    void DrawCard(const DRAWITEMSTRUCT* d);
     void DrawOwner(const DRAWITEMSTRUCT* d)
     {
+        if (d->hwndItem == g_card) { DrawCard(d); return; }
         HDC dc = d->hDC;
         RECT r = d->rcItem;
         wchar_t text[160] = L"";
@@ -789,6 +858,56 @@ namespace
         return _wcsicmp(cls, L"Button") == 0 && (GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW;
     }
 
+    void DrawCard(const DRAWITEMSTRUCT* d)
+    {
+        HDC dc = d->hDC;
+        RECT r = d->rcItem;
+        FillSolid(dc, r, kBg);
+        bool ok = g_info.gameFound;
+        RECT b = r;
+        InflateRect(&b, -1, -1);
+        RoundBox(dc, b, ok ? kReady : kMissing, ok ? kReadyEdge : kMissingEdge, S(14));
+        int dot = S(14), cy = (r.top + r.bottom) / 2;
+        HBRUSH db = CreateSolidBrush(ok ? RGB(140, 232, 160) : RGB(255, 196, 96));
+        HGDIOBJ ob = SelectObject(dc, db), op = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, r.left + S(18), cy - dot / 2, r.left + S(18) + dot, cy + dot / 2);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(db);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        HGDIOBJ of = SelectObject(dc, g_bold);
+        RECT t1{ r.left + S(46), r.top + S(8), r.right - S(12), cy };
+        DrawTextW(dc, ok ? L"Ready to play" : L"Game files needed", -1, &t1, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, g_font);
+        SetTextColor(dc, RGB(226, 236, 228));
+        std::wstring line = ok ? g_info.gameDir.wstring() : L"Install from your package below, or drop the package file onto this window.";
+        RECT t2{ r.left + S(46), cy, r.right - S(12), r.bottom - S(8) };
+        DrawTextW(dc, line.c_str(), -1, &t2, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS);
+        SelectObject(dc, of);
+    }
+
+    void OnInstalled()
+    {
+        g_info.gameFound = true;
+        g_info.gameDir = PortDir() / "game";
+        if (g_installBtn) SetWindowTextW(g_installBtn, L"Reinstall from package...");
+        if (g_card) InvalidateRect(g_card, nullptr, FALSE);
+        LoadArt();
+        InvalidateRect(g_wnd, nullptr, FALSE);
+        StartTitleCapture(true);   // fresh art from the newly installed game
+        MessageBoxW(g_wnd, L"Installed. Press Play to start.", L"Peggle 2", MB_ICONINFORMATION);
+    }
+
+    void SaveNow()
+    {
+        ApplyAll();
+        SavePortSettings();
+        g_savedUntil = GetTickCount64() + 2500;
+        RECT hint{ S(kPageX), S(kH - 34), S(kW), S(kH) };
+        InvalidateRect(g_wnd, &hint, FALSE);
+    }
+
     void ShowPage(int i)
     {
         g_page = i;
@@ -817,6 +936,8 @@ namespace
         case WM_NOTIFY:
         {
             auto* nm = (NMHDR*)lp;
+            if (nm->code == NM_CUSTOMDRAW && std::find(g_lists.begin(), g_lists.end(), nm->hwndFrom) != g_lists.end())
+                return ListRowColors((NMLVCUSTOMDRAW*)lp);
             if (nm->hwndFrom == g_padList && nm->code == LVN_ITEMCHANGED)
             {
                 int row = ListView_GetNextItem(g_padList, -1, LVNI_SELECTED);
@@ -857,6 +978,7 @@ namespace
             int id = LOWORD(wp);
             if (id == kIdPlay) { ApplyAll(); g_play = true; DestroyWindow(h); return 0; }
             if (id == kIdQuit) { ApplyAll(); g_play = false; DestroyWindow(h); return 0; }
+            if (id == kIdSave) { SaveNow(); return 0; }
             if (id >= kIdNav && id < kIdNav + int(g_pages.size())) { ShowPage(id - kIdNav); return 0; }
             break;
         }
@@ -870,6 +992,21 @@ namespace
             return ColorStatic((HWND)lp, (HDC)wp);
         case WM_CTLCOLORBTN:
             return (LRESULT)g_sideBrush;
+        case WM_DROPFILES:
+        {
+            // A package dropped onto the window: install it.
+            HDROP drop = (HDROP)wp;
+            wchar_t file[MAX_PATH] = L"";
+            DragQueryFileW(drop, 0, file, MAX_PATH);
+            DragFinish(drop);
+            if (file[0] && g_info.installPackageFrom)
+            {
+                std::wstring q = std::wstring(L"Install Peggle 2 from this package?\n\n") + file;
+                if (MessageBoxW(h, q.c_str(), L"Peggle 2", MB_YESNO | MB_ICONQUESTION) == IDYES && g_info.installPackageFrom(h, file))
+                    OnInstalled();
+            }
+            return 0;
+        }
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
@@ -885,6 +1022,16 @@ namespace
             FillSolid(mdc, cr, kBg);
             PaintHeader(mdc, RECT{ 0, 0, cr.right, S(kHeaderH) });
             FillSolid(mdc, RECT{ 0, S(kHeaderH), S(kSideW), cr.bottom }, kSide);
+            {
+                SetBkMode(mdc, TRANSPARENT);
+                HGDIOBJ of = SelectObject(mdc, g_font);
+                RECT hint{ S(kPageX), S(kH - 34), cr.right - S(20), S(kH - 10) };
+                bool saved = GetTickCount64() < g_savedUntil;
+                SetTextColor(mdc, saved ? RGB(140, 232, 160) : kMuted);
+                DrawTextW(mdc, saved ? L"Settings saved." : L"Enter  Play      Esc  Quit      Ctrl+S  Save      Settings are saved when you press Play.",
+                          -1, &hint, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                SelectObject(mdc, of);
+            }
             BitBlt(dc, 0, 0, cr.right, cr.bottom, mdc, 0, 0, SRCCOPY);
             SelectObject(mdc, old);
             DeleteObject(bmp);
@@ -893,7 +1040,15 @@ namespace
             return 0;
         }
         case WM_TIMER:
-            if (wp == kTimerHover) { UpdateHover(); PollPad(); }
+            if (wp == kTimerHover)
+            {
+                UpdateHover();
+                PollPad();
+                static bool wasSaved = false;   // clear the "Settings saved" note when it expires
+                bool saved = GetTickCount64() < g_savedUntil;
+                if (wasSaved && !saved) { RECT hint{ S(kPageX), S(kH - 34), S(kW), S(kH) }; InvalidateRect(h, &hint, FALSE); }
+                wasSaved = saved;
+            }
             if (wp == kTimerCapture && g_capture && WaitForSingleObject(g_capture, 0) == WAIT_OBJECT_0)
             {
                 CloseHandle(g_capture);
@@ -1018,8 +1173,11 @@ bool RunLauncher(const LauncherInfo& info)
     }
     HWND play = CreateWindowExW(0, L"BUTTON", L"Play", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(16), S(kH - 16 - 34 - 10 - 58), S(kSideW - 32), S(58), g_wnd, (HMENU)kIdPlay, inst, nullptr);
+    int half = (kSideW - 32 - 8) / 2;
+    CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                    S(16), S(kH - 16 - 34), S(half), S(34), g_wnd, (HMENU)kIdSave, inst, nullptr);
     HWND quit = CreateWindowExW(0, L"BUTTON", L"Quit", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                S(16), S(kH - 16 - 34), S(kSideW - 32), S(34), g_wnd, (HMENU)kIdQuit, inst, nullptr);
+                                S(16 + half + 8), S(kH - 16 - 34), S(half), S(34), g_wnd, (HMENU)kIdQuit, inst, nullptr);
 
     BuildPlay();
     BuildDisplay();
@@ -1036,6 +1194,7 @@ bool RunLauncher(const LauncherInfo& info)
     SetFocus(play);
     (void)quit;
     SetTimer(g_wnd, kTimerHover, 50, nullptr);
+    DragAcceptFiles(g_wnd, TRUE);
     const char* shot = getenv("PEGGLE2_LAUNCHER_SHOT");
     if (!shot)
     {
@@ -1075,6 +1234,20 @@ bool RunLauncher(const LauncherInfo& info)
     while (GetMessageW(&m, nullptr, 0, 0) > 0)
     {
         if (CaptureKey(m)) continue;
+        // Enter plays, Esc quits, Ctrl+S saves (unless a dropdown list is open).
+        if (m.message == WM_KEYDOWN && GetAncestor(m.hwnd, GA_ROOT) == g_wnd)
+        {
+            HWND focus = GetFocus();
+            wchar_t cls[32] = L"";
+            if (focus) GetClassNameW(focus, cls, 32);
+            bool dropped = _wcsicmp(cls, WC_COMBOBOXW) == 0 && SendMessageW(focus, CB_GETDROPPEDSTATE, 0, 0);
+            if (!dropped)
+            {
+                if (m.wParam == VK_RETURN) { PostMessageW(g_wnd, WM_COMMAND, kIdPlay, 0); continue; }
+                if (m.wParam == VK_ESCAPE) { PostMessageW(g_wnd, WM_COMMAND, kIdQuit, 0); continue; }
+                if (m.wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000)) { SaveNow(); continue; }
+            }
+        }
         if (!IsDialogMessageW(g_wnd, &m))
         {
             TranslateMessage(&m);
@@ -1098,6 +1271,8 @@ bool RunLauncher(const LauncherInfo& info)
     g_checks.clear();
     g_notes.clear();
     g_nav_buttons.clear();
+    g_card = g_installBtn = nullptr;
+    g_lists.clear();
     SavePortSettings();
     if (g_play && !g_info.gameFound)
     {

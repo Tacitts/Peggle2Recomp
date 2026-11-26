@@ -8,10 +8,12 @@
 #include <windows.h>
 
 bool InstallGamePackage(HWND owner);
+bool InstallGamePackageFrom(HWND owner, const std::filesystem::path& file);
 void CheckForUpdates(HWND owner, bool interactive);
 
 void AddLauncherExtras(LauncherInfo& info)
 {
     info.installPackage = [](HWND__* owner) { return InstallGamePackage(owner); };
+    info.installPackageFrom = [](HWND__* owner, const std::filesystem::path& file) { return InstallGamePackageFrom(owner, file); };
     info.checkForUpdates = [](HWND__* owner, bool interactive) { CheckForUpdates(owner, interactive); };
 }

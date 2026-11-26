@@ -10,7 +10,8 @@ struct LauncherInfo
     bool gameFound = false;
     std::filesystem::path gameDir;
     // Optional pieces supplied by other modules (left empty when unavailable).
-    std::function<bool(HWND__* owner)> installPackage;                                   // install.cpp
+    std::function<bool(HWND__* owner)> installPackage;                                   // install.cpp (asks for the file)
+    std::function<bool(HWND__* owner, const std::filesystem::path& file)> installPackageFrom; // install.cpp (dropped file)
     std::function<void(HWND__* owner, bool interactive)> checkForUpdates;               // updater.cpp
 };
 

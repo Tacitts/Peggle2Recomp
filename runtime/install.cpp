@@ -211,6 +211,8 @@ namespace
 }
 
 // Ask for the package, extract it with a progress window. Returns true when installed.
+bool InstallGamePackageFrom(HWND owner, const std::filesystem::path& file);
+
 bool InstallGamePackage(HWND owner)
 {
     wchar_t file[MAX_PATH] = L"";
@@ -222,7 +224,12 @@ bool InstallGamePackage(HWND owner)
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return false;
+    return InstallGamePackageFrom(owner, file);
+}
 
+// Extract a package file (chosen above, or dropped onto the launcher).
+bool InstallGamePackageFrom(HWND owner, const std::filesystem::path& file)
+{
     std::filesystem::path out = PortDir() / "game";
     g_done = 0;
     g_total = 1;
