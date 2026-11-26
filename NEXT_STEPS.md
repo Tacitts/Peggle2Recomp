@@ -47,11 +47,14 @@ State at this commit, for whoever continues:
   4. `timeBeginPeriod(1)` for the whole run (it was only set in profiling modes).
   After: in a level 0-4 of 300 frames per 10 s are shown late (mostly 35-48 ms), with no
   repeated or skipped frames.
-- **What is left:** (a) the intro and menu movies are Bink 2 at 60 fps, paced by the title on
-  the audio clock (6 audio frames of 256 samples = 32 ms per step vs 33.3 ms per flip), so about
-  every 0.8 s one movie frame waits an extra vblank. That is the title's own pacing (`0x82623150`
-  / `0x8261D378` spin on Bink's audio-frame counter), not a decoder speed problem; all decode
-  threads are idle. (b) Loading into a level: about 4 frames of 100-160 ms. The main thread is in
+- **What is left:** (a) Movies: CORRECTED 2026-11-26. The "movie judder" was a measurement
+  artifact. The CPU-side "[frames] new frames shown" times include render-thread jitter (movie
+  textures are uploaded every frame) that never reaches the screen. With flip pacing, the game's
+  flips during the intro are regular (`PEGGLE2_FLIP_LOG=1`: 547 requests, 2 late), and DXGI frame
+  statistics (`[frames] on screen` lines; F3 overlay "hitches on screen") show new frames 2
+  refreshes apart throughout the movie: `tools/bench_movie.ps1 -Runs 3` found 6 hitches in about
+  2,600 frames, nearly all during boot. Use the on-screen lines, not the CPU-side ones, to judge
+  smoothness. (b) Loading into a level: about 4 frames of 100-160 ms. The main thread is in
   the title's loading code (`0x82422D50`, `0x82490740`, `0x82427508`, `0x82404ED8`) while
   thread 11 inflates assets. The title's `memcpy` (`0x825F0AE0`, 1,083 call sites) is now a
   native `memmove` (hooks.cpp); it was the hottest single function in those frames, but one A/B

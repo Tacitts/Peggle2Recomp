@@ -308,6 +308,51 @@ namespace
     uint64_t g_shownSerial = 0;         // serial of the draw list the last PresentFrame drew
     FrameHist g_newFrameHist;           // time between presents that showed a new draw list
     FrameHist g_renderWorkHist;         // PresentFrame CPU time (includes the Present() wait)
+
+    // On-screen timing (DXGI frame statistics): for each present, the display refresh it appeared
+    // on. New frames should appear every 2 refreshes at 30 fps; 3 or more is a visible hitch.
+    // This is what the player sees, unlike the CPU-side present times above.
+    struct DisplayStats
+    {
+        UINT lastPresentCount = 0, lastRefresh = 0;
+        uint64_t gaps[6] = {};          // display interval in refreshes: 1, 2, 3, 4, 5, 6+
+        uint64_t unavailable = 0;
+        uint32_t secHitches = 0, secWorstGap = 0;   // for the F3 overlay, taken once a second
+        void Poll(IDXGISwapChain* sc)
+        {
+            DXGI_FRAME_STATISTICS st{};
+            if (FAILED(sc->GetFrameStatistics(&st))) { unavailable++; return; }
+            if (st.PresentCount == lastPresentCount || st.PresentRefreshCount == 0) return;
+            if (lastPresentCount && st.PresentCount == lastPresentCount + 1 && st.PresentRefreshCount > lastRefresh)
+            {
+                UINT gap = st.PresentRefreshCount - lastRefresh;
+                gaps[std::min<UINT>(gap, 6) - 1]++;
+                if (gap >= 3) secHitches++;
+                secWorstGap = std::max<uint32_t>(secWorstGap, gap);
+                static int logged = 0;
+                static const auto start = std::chrono::steady_clock::now();
+                if (gap >= 3 && logged++ < 60)
+                    Log("[frames] on-screen hitch: present %u shown %u refreshes after the previous (%.1f s after start)", st.PresentCount, gap,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            }
+            lastPresentCount = st.PresentCount;
+            lastRefresh = st.PresentRefreshCount;
+        }
+        std::string TakeLine()
+        {
+            char buf[256];
+            uint64_t n = 0, hitches = 0;
+            for (int i = 0; i < 6; i++) n += gaps[i];
+            for (int i = 2; i < 6; i++) hitches += gaps[i];
+            snprintf(buf, sizeof(buf), "on screen: %llu frames, every 1 refresh %llu, 2 refreshes %llu, 3: %llu, 4: %llu, 5+: %llu; hitches (3+) %llu%s",
+                     (unsigned long long)n, (unsigned long long)gaps[0], (unsigned long long)gaps[1], (unsigned long long)gaps[2],
+                     (unsigned long long)gaps[3], (unsigned long long)(gaps[4] + gaps[5]), (unsigned long long)hitches,
+                     unavailable ? " (statistics unavailable for some presents)" : "");
+            for (auto& g : gaps) g = 0;
+            unavailable = 0;
+            return buf;
+        }
+    } g_display;
     std::atomic<bool> g_ready{ false };
 
     // PEGGLE2_CAPTURE_TITLE=<png path>: the launcher's art capture. The game runs hidden and muted
@@ -491,6 +536,12 @@ namespace
         {
             g_ov.fps = g_ov.newFrames / el;
             g_ov.shownWorst = g_ov.worstMs;
+            if (g_display.secWorstGap)   // on-screen timing available: use it (what the player sees)
+            {
+                g_ov.shownWorst = g_display.secWorstGap * 16.667;
+                g_ov.late = g_display.secHitches;
+            }
+            g_display.secHitches = g_display.secWorstGap = 0;
             g_ov.workAvg = g_ov.workN ? g_ov.workSum / g_ov.workN : 0;
             g_ov.lateLastSec = g_ov.late;
             g_ov.lateHistory.push_back(g_ov.late);
@@ -927,7 +978,7 @@ namespace
                 for (uint32_t n : g_ov.lateHistory) late10 += n;
                 snprintf(line, sizeof(line), "worst frame %.1f ms   render %.1f ms", g_ov.shownWorst, g_ov.workAvg);
                 rows.push_back({ line, RGB(230, 230, 230) });
-                snprintf(line, sizeof(line), "late frames: %u last second, %u last 10 s", g_ov.lateLastSec, late10);
+                snprintf(line, sizeof(line), "hitches on screen: %u last second, %u last 10 s", g_ov.lateLastSec, late10);
                 rows.push_back({ line, late10 ? RGB(255, 200, 80) : RGB(230, 230, 230) });
             }
             UINT packed = DrawOverlayText(rows), oh = packed & 0xFFFF, ow = packed >> 16;
@@ -1018,6 +1069,7 @@ namespace
         ID3D12CommandList* lists[] = { g_list };
         g_queue->ExecuteCommandLists(1, lists);
         g_swapChain->Present(GetSettings().vsync ? 1 : 0, 0);
+        g_display.Poll(g_swapChain);
         g_fenceValues[i] = g_nextFence;
         g_queue->Signal(g_fence, g_nextFence++);
         if (readback)
@@ -1114,7 +1166,13 @@ namespace
                 std::unique_lock<std::mutex> lk(g_presentLock);
                 // Present only new frames: re-presenting the old one at 60 Hz made a frame that
                 // arrived during that Present() wait an extra vblank (50 ms instead of 33).
-                bool fresh = g_presentCv.wait_for(lk, std::chrono::milliseconds(50), [] { return g_requested != g_presented; });
+                // Waited in 4 ms slices so the on-screen statistics see every present (DisplayStats).
+                bool fresh = false;
+                for (int slice = 0; slice < 12 && !fresh; slice++)
+                {
+                    fresh = g_presentCv.wait_for(lk, std::chrono::milliseconds(4), [] { return g_requested != g_presented; });
+                    if (!fresh && g_swapChain) g_display.Poll(g_swapChain);
+                }
                 if (!fresh && !g_resizePending) continue;   // keep pumping window messages
                 frame = g_requested;
                 g_presented = g_requested;
@@ -1160,6 +1218,7 @@ namespace
                 Log("[frames] %s; %llu repeated a frame, %llu frames never shown", g_newFrameHist.TakeLine("new frames shown").c_str(),
                     (unsigned long long)dupPresents, (unsigned long long)skippedLists);
                 Log("[frames] %s", g_renderWorkHist.TakeLine("render thread per present").c_str());
+                Log("[frames] %s", g_display.TakeLine().c_str());
                 {
                     std::lock_guard<std::mutex> g(g_drawsLock);
                     if (g_flipPacing)

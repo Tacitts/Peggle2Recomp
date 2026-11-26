@@ -11,6 +11,9 @@
 // Note: a hooked function's original body (__imp__sub_X) may be attributed in call chains
 // to the guest function that precedes it, because the function table points at the hook.
 #include "runtime.h"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #include "xenos.h"
 #include <algorithm>
 #include <atomic>
@@ -88,6 +91,8 @@ PPC_FUNC(sub_82453B78)
 // in order; the renderer then presents the next submitted frame (render.cpp).
 static std::atomic<uint32_t> g_d3dDevice{ 0 };
 static uint32_t g_flipCount = 0;   // GPU thread only (both handlers run on it)
+static int64_t g_vblankQpc = 0;    // when the title's vblank handler last ran (PEGGLE2_FLIP_LOG)
+static const bool g_flipLog = getenv("PEGGLE2_FLIP_LOG") != nullptr;
 static void NoteFlips()
 {
     uint32_t dev = g_d3dDevice.load(std::memory_order_relaxed);
@@ -103,6 +108,12 @@ PPC_FUNC(sub_8261EF88)
     {
         g_d3dDevice = ctx.r3.u32;
         g_flipCount = Load32(ctx.r3.u32 + 16976);
+    }
+    if (g_flipLog)
+    {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        g_vblankQpc = q.QuadPart;
     }
     __imp__sub_8261EF88(ctx, base);
     NoteFlips();
@@ -137,7 +148,26 @@ PPC_FUNC(sub_8261F0B8)
         return v ? uint32_t(std::clamp(atoi(v), 0, 100)) : 100u;
     }();
     ctx.r3.u64 = (ctx.r3.u32 & ~0xFFu) | tearWindow;
+    // PEGGLE2_FLIP_LOG: one line per flip request (movie cadence work): the vblank count, the
+    // previous flip's target, the new target, how far into the current vblank the request came,
+    // and whether it was late (due at or before this vblank).
+    uint32_t dev = g_d3dDevice.load(std::memory_order_relaxed);
+    uint32_t vb = 0, lastTarget = 0, flipsBefore = 0, interval = (ctx.r3.u32 >> 8) & 0xF;
+    if (g_flipLog && dev) { vb = Load32(dev + 16952); lastTarget = Load32(dev + 16960); flipsBefore = Load32(dev + 16976); }
     __imp__sub_8261F0B8(ctx, base);
+    if (g_flipLog && dev)
+    {
+        static int n = 0;
+        LARGE_INTEGER q, f;
+        QueryPerformanceCounter(&q);
+        QueryPerformanceFrequency(&f);
+        double into = g_vblankQpc ? double(q.QuadPart - g_vblankQpc) * 1000.0 / double(f.QuadPart) : -1;
+        uint32_t target = Load32(dev + 16960), flips = Load32(dev + 16976);
+        if (n++ < 600)
+            Log("[flip] req %d: vblank %u, last target %u, interval %u -> target %u (%+d), %.1f ms into the vblank, %s%s", n, vb, lastTarget,
+                interval, target, int(target - vb), into, flips != flipsBefore ? "flipped now" : "queued",
+                lastTarget + interval <= vb ? ", LATE" : "");
+    }
     NoteFlips();   // an immediate flip
 }
 PPC_FUNC_IMPL(__imp__sub_8242F2C8);
