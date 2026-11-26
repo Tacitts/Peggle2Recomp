@@ -401,10 +401,9 @@ namespace
         Check(p, 0, 60, 640, L"Performance overlay (F3 toggles while playing)", &s.perfOverlay);
         Combo<std::string>(p, 0, 100, 160, 320, L"Language:", &s.language,
                            { { L"System default", "auto" }, { L"English", "en" }, { L"French", "fr" }, { L"German", "de" },
-                             { L"Spanish", "es" }, { L"Italian", "it" }, { L"Japanese", "ja" }, { L"Korean", "ko" },
-                             { L"Chinese (Traditional)", "zh" }, { L"Portuguese", "pt" }, { L"Polish", "pl" }, { L"Russian", "ru" } });
-        Note(p, 0, 140, 660, 40, L"The language is passed to the game the way the console's system setting is; languages the game "
-                                 L"does not include fall back to English.");
+                             { L"Spanish", "es" }, { L"Italian", "it" }, { L"Portuguese", "pt" } });
+        Note(p, 0, 140, 660, 40, L"The six languages Peggle 2 includes. System default picks yours if it is one of them, "
+                                 L"otherwise English.");
     }
 
     void BuildControls()

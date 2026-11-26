@@ -195,3 +195,16 @@ PPC_FUNC(sub_825F0AE0)
     if (len && dst != src) memmove(GuestPtr(dst), GuestPtr(src), len);
     // r3 (the return value) is already the destination.
 }
+
+// ---- Native memmove ---------------------------------------------------------------------------
+// 0x825EEB90 is the title's memmove (r3 dest, r4 src, r5 length; returns dest), called from 291
+// places: forward moves already went to the memcpy above, backward ones (shifting a list's tail,
+// e.g. the resource loader erasing finished entries every frame while loading) copied a word at
+// a time in recompiled code.
+PPC_FUNC_IMPL(__imp__sub_825EEB90);
+PPC_FUNC(sub_825EEB90)
+{
+    uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, len = ctx.r5.u32;
+    if (len && dst != src) memmove(GuestPtr(dst), GuestPtr(src), len);
+    // r3 (the return value) is already the destination.
+}
