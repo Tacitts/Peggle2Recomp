@@ -28,6 +28,7 @@
 #include <wincodec.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <xinput.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -262,12 +263,22 @@ namespace
             : L"Game files not found. Install them from your own Xbox Live Arcade package (Install from package), "
               L"or place the extracted files in a folder named \"game\" next to the program.";
         Note(p, 0, 28, 660, 40, status.c_str());
+        if (g_info.gameFound && Achievements().empty()) LoadAchievements(g_info.gameDir, XboxLanguageId());
+        if (!Achievements().empty())
+        {
+            uint32_t total = 0, score = 0, unlocked = 0;
+            for (auto& a : Achievements()) { total += a.gamerscore; if (a.unlockedAt) { unlocked++; score += a.gamerscore; } }
+            wchar_t line[160];
+            swprintf(line, 160, L"Achievements: %u of %zu unlocked, %u of %u G", unlocked, Achievements().size(), score, total);
+            Label(p, 0, 52, 660, line);
+        }
         if (g_info.installPackage)
-            Button(p, 0, 74, 200, L"Install from package...", [] {
+            Button(p, 0, 86, 200, L"Install from package...", [] {
                 if (g_info.installPackage(g_wnd)) { g_info.gameFound = true; MessageBoxW(g_wnd, L"Installed. Press Play to start.", L"Peggle 2", MB_ICONINFORMATION); }
             });
-        Combo<bool>(p, 0, 120, 120, 200, L"Game mode:", &s.trial, { { L"Full game", false }, { L"Trial", true } });
-        Note(p, 0, 160, 660, 120,
+        Combo<bool>(p, 0, 132, 120, 200, L"Game mode:", &s.trial, { { L"Full game", false }, { L"Trial", true } });
+        Note(p, 0, 176, 660, 140,
+             L"Controller: A or Start plays, B quits, LB / RB switch pages.\n\n"
              L"Keys while playing: F11 or Alt+Enter fullscreen, F2 frame counter, F3 performance overlay, F12 screenshot.\n\n"
              L"Keyboard: arrows or WASD aim, Space fires, Enter pauses, Esc goes back (rebind on the Controls page).");
     }
@@ -745,6 +756,39 @@ namespace
         if (now) InvalidateRect(now, nullptr, FALSE);
     }
 
+    // Controller: A / Start play, B / Back quit, LB / RB and the D-pad switch pages (focused only).
+    void PollPad()
+    {
+        static WORD last = 0;
+        static int slot = -1;
+        static ULONGLONG nextScan = 0;
+        XINPUT_STATE st{};
+        bool ok = slot >= 0 && XInputGetState(DWORD(slot), &st) == ERROR_SUCCESS;
+        if (!ok && GetTickCount64() >= nextScan)
+        {
+            nextScan = GetTickCount64() + 2000;
+            slot = -1;
+            for (DWORD i = 0; i < 4 && slot < 0; i++)
+                if (XInputGetState(i, &st) == ERROR_SUCCESS) { slot = int(i); ok = true; }
+        }
+        WORD now = ok ? st.Gamepad.wButtons : 0;
+        WORD pressed = WORD(now & ~last);
+        last = now;
+        if (!pressed || GetForegroundWindow() != g_wnd) return;
+        int pages = int(g_pages.size());
+        if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)) PostMessageW(g_wnd, WM_COMMAND, kIdPlay, 0);
+        else if (pressed & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_BACK)) PostMessageW(g_wnd, WM_COMMAND, kIdQuit, 0);
+        else if (pressed & (XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_DPAD_DOWN)) PostMessageW(g_wnd, WM_COMMAND, kIdNav + (g_page + 1) % pages, 0);
+        else if (pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_DPAD_UP)) PostMessageW(g_wnd, WM_COMMAND, kIdNav + (g_page + pages - 1) % pages, 0);
+    }
+
+    bool IsOwnerButton(HWND h)
+    {
+        wchar_t cls[16] = L"";
+        GetClassNameW(h, cls, 16);
+        return _wcsicmp(cls, L"Button") == 0 && (GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW;
+    }
+
     void ShowPage(int i)
     {
         g_page = i;
@@ -789,6 +833,9 @@ namespace
         case WM_DRAWITEM:
             DrawOwner((const DRAWITEMSTRUCT*)lp);
             return TRUE;
+        case WM_SETCURSOR:
+            if (IsOwnerButton((HWND)wp)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+            break;
         case WM_CTLCOLORSTATIC:
             return ColorStatic((HWND)lp, (HDC)wp);
         case WM_CTLCOLORBTN:
@@ -816,6 +863,9 @@ namespace
         case WM_DRAWITEM:
             DrawOwner((const DRAWITEMSTRUCT*)lp);
             return TRUE;
+        case WM_SETCURSOR:
+            if (IsOwnerButton((HWND)wp)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+            break;
         case WM_CTLCOLORSTATIC:
             return ColorStatic((HWND)lp, (HDC)wp);
         case WM_CTLCOLORBTN:
@@ -843,7 +893,7 @@ namespace
             return 0;
         }
         case WM_TIMER:
-            if (wp == kTimerHover) UpdateHover();
+            if (wp == kTimerHover) { UpdateHover(); PollPad(); }
             if (wp == kTimerCapture && g_capture && WaitForSingleObject(g_capture, 0) == WAIT_OBJECT_0)
             {
                 CloseHandle(g_capture);

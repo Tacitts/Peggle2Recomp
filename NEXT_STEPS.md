@@ -98,11 +98,21 @@ State at this commit, for whoever continues:
   `achievements.cpp` (XDBF from Default.xex: 28 achievements; awards arrive as XGI app 0xFB
   message 0x000B0008 in xmsg.cpp), `updater.cpp` (WinHTTP, GitHub releases, tar.exe), the
   overlay and display options in `render.cpp`, controls in `input.cpp`, trial and language in
-  `xam.cpp` / `kernel.cpp` (`ExGetXConfigSetting`, which the game reads at boot). Not verified
-  yet: an achievement actually being awarded in play (the XGI message id is from Xenia's
-  documentation), installing from a real package through the launcher, an update (no releases
-  have been published; publishing one needs a zip with Peggle2.exe and the two DXC DLLs),
-  vibration on a real controller, and the game's own languages (the language list is the console's).
+  `xam.cpp` / `kernel.cpp` (`ExGetXConfigSetting`, which the game reads at boot). Confirmed: an
+  achievement awarded during an autoplayed level arrived as XGI message 0x000B0008 and was saved
+  (achievement 27). Not verified yet: installing from a real package through the launcher, an
+  update (v0.1.0 is a source-only release, so there is nothing to download), vibration on a real
+  controller, and the game's own languages (the language list is the console's).
+- **Launcher look (2026-11-26).** Dark window: the title screen across the top, captured from the
+  player's own copy by a hidden, muted run of the game (`PEGGLE2_CAPTURE_TITLE=<png>`, frame 750,
+  saved to `userdata\launcher_title.png`; the launcher starts it on first launch and swaps the art
+  in when done), page sidebar, owner-drawn buttons/checkboxes, black title bar, hand cursor,
+  controller navigation (A/Start play, B quit, LB/RB pages). Exe icon built from
+  `game\SmallLogo.png` by `tools/make_icon.py`. No art is stored in the repo. The game window
+  hides an idle mouse pointer and remembers its size/position/fullscreen (`[display] last_*`).
+  The owner wanted it to resemble the South Park Tenorman's Revenge recomp's launcher; that
+  launcher could not be viewed this session (screen access needs it in the Start menu, and a
+  "South Park TR" Start-menu shortcut now exists for a later session).
 - **Crash reporting was broken (fixed):** the log-buffering change left `CrashHandler` returning
   before its report, and floating-point traps were never reported. Both fixed; the handler masks
   FP exceptions before formatting its report.

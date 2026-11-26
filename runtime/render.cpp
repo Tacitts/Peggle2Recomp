@@ -332,6 +332,7 @@ namespace
     std::atomic<bool> g_resizePending{ false };
     std::atomic<UINT> g_pendingW{ kWidth }, g_pendingH{ kHeight };
     bool g_fullscreen = false;
+    bool g_fullscreenState() { return g_fullscreen; }
     RECT g_windowedRect{};
     LONG_PTR g_windowedStyle = 0;
 
@@ -379,6 +380,41 @@ namespace
     const bool g_forcePreview = getenv("PEGGLE2_PREVIEW") != nullptr;
 
     std::atomic<bool> g_screenshotRequested{ false };   // F12 (see SaveScreenshot)
+
+    // Mouse pointer: hidden over the game after 2 s without movement (the game uses the pad or keys).
+    ULONGLONG g_lastMouseMove = 0;
+    bool g_pointerHidden = false;
+    void UpdatePointer(HWND hwnd)
+    {
+        if (g_pointerHidden || GetForegroundWindow() != hwnd || GetTickCount64() - g_lastMouseMove < 2000) return;
+        POINT pt;
+        RECT cr;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        GetClientRect(hwnd, &cr);
+        if (!PtInRect(&cr, pt)) return;
+        g_pointerHidden = true;
+        SetCursor(nullptr);
+    }
+
+    void ToggleFullscreen(HWND hwnd);
+    bool g_fullscreenState();
+    // Remember the window as it was (size, position, fullscreen) for the next start.
+    void SaveWindowPlacement(HWND hwnd)
+    {
+        Settings& s = GetSettings();
+        s.fullscreen = g_fullscreenState();
+        if (!s.fullscreen && !IsIconic(hwnd) && !IsZoomed(hwnd))
+        {
+            RECT r;
+            GetWindowRect(hwnd, &r);
+            s.lastX = r.left;
+            s.lastY = r.top;
+            s.lastW = r.right - r.left;
+            s.lastH = r.bottom - r.top;
+        }
+        SavePortSettings();
+    }
 
     // ---- F2 frame counter / F3 performance overlay / achievement pop-up ----------------------
     // Text drawn with GDI into a small bitmap (two slots: 0 the counter, 1 the pop-up) and copied
@@ -484,7 +520,15 @@ namespace
     {
         switch (msg)
         {
+        case WM_MOUSEMOVE:
+            g_lastMouseMove = GetTickCount64();
+            if (g_pointerHidden) { g_pointerHidden = false; SetCursor(LoadCursor(nullptr, IDC_ARROW)); }
+            break;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT && g_pointerHidden) { SetCursor(nullptr); return TRUE; }
+            break;
         case WM_CLOSE:
+            SaveWindowPlacement(hwnd);
             Log("[render] window closed: exiting");
             TerminateProcess(GetCurrentProcess(), 0);
             break;
@@ -552,6 +596,11 @@ namespace
         LONG x = mi.rcWork.left + std::max<LONG>(0, (workW - ww) / 2), y = mi.rcWork.top + std::max<LONG>(0, (workH - wh) / 2);
         wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));   // icon built from the game's logo, if present
         RegisterClassW(&wc);
+        if (!g_captureTitle && set.windowWidth == 0 && set.lastW >= 320 && set.lastH >= 200)
+        {
+            RECT last{ set.lastX, set.lastY, set.lastX + set.lastW, set.lastY + set.lastH };
+            if (MonitorFromRect(&last, MONITOR_DEFAULTTONULL)) { x = last.left; y = last.top; ww = set.lastW; wh = set.lastH; }
+        }
         g_hwnd = CreateWindowW(wc.lpszClassName, L"Peggle 2", WS_OVERLAPPEDWINDOW | (g_captureTitle ? 0 : WS_VISIBLE),
                                x, y, ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd) { Log("[render] CreateWindow failed (%lu)", GetLastError()); return false; }
@@ -1072,6 +1121,7 @@ namespace
                 preview = g_pendingPreview;
                 hasPreview = g_hasPreview;
             }
+            UpdatePointer(g_hwnd);
             auto workStart = std::chrono::steady_clock::now();
             PresentFrame(frame, hasPreview ? &preview : nullptr);
             auto now = std::chrono::steady_clock::now();

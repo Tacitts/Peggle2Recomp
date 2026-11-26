@@ -106,6 +106,10 @@ void LoadPortSettings()
     I("display.monitor", s.monitor, 0, 16);
     I("display.window_width", s.windowWidth, 0, 16384);
     I("display.window_height", s.windowHeight, 0, 16384);
+    I("display.last_x", s.lastX, -32768, 32767);
+    I("display.last_y", s.lastY, -32768, 32767);
+    I("display.last_width", s.lastW, 0, 16384);
+    I("display.last_height", s.lastH, 0, 16384);
     B("display.stretch", s.stretch);
     B("display.vsync", s.vsync);
     I("graphics.render_scale", s.renderScale, 1, 4);
@@ -156,6 +160,7 @@ bool SavePortSettings()
     o << "# Peggle 2 recompiled: settings (written by the launcher; safe to edit by hand)\n\n";
     o << "[display]\nfullscreen = " << b(s.fullscreen) << "\nmonitor = " << s.monitor
       << "\nwindow_width = " << s.windowWidth << "\nwindow_height = " << s.windowHeight
+      << "\nlast_x = " << s.lastX << "\nlast_y = " << s.lastY << "\nlast_width = " << s.lastW << "\nlast_height = " << s.lastH
       << "\nstretch = " << b(s.stretch) << "\nvsync = " << b(s.vsync) << "\n\n";
     o << "[graphics]\nrender_scale = " << s.renderScale << "\nmsaa = " << s.msaa << "\nfxaa = " << b(s.fxaa)
       << "\nanisotropy = " << s.anisotropy << "\n\n";

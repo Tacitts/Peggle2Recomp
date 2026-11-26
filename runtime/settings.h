@@ -14,6 +14,7 @@ struct Settings
     bool fullscreen = false;           // borderless fullscreen on `monitor` (F11 / Alt+Enter toggle)
     int monitor = 0;                   // 0 = primary, 1.. = others in enumeration order
     int windowWidth = 0, windowHeight = 0;   // 0 = fit to the screen
+    int lastX = 0, lastY = 0, lastW = 0, lastH = 0;   // game window as it was last closed (0: none)
     bool stretch = false;              // fill the window instead of letterboxing to 16:9
     bool vsync = true;
 
