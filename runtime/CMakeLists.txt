@@ -45,6 +45,7 @@ add_executable(Peggle2
     render.cpp
     draw.cpp
     xenos_shader.cpp
+    zlib_native.cpp
     generated/import_stubs.cpp
 )
 target_include_directories(Peggle2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
@@ -66,6 +67,20 @@ if (EXISTS "${PEGGLE2_FFMPEG_ROOT}/include/libavcodec/avcodec.h")
     message(STATUS "FFmpeg found in ${PEGGLE2_FFMPEG_ROOT}: XMA audio enabled")
 else()
     message(STATUS "FFmpeg not found (${PEGGLE2_FFMPEG_ROOT}): XMA audio disabled")
+endif()
+
+# Optional: native zlib for the title's inflate() (zlib_native.cpp), from the same vcpkg tree:
+#   vcpkg install "zlib:x64-windows-static"
+# Without it the title's recompiled zlib 1.1.3 is used (slower loading).
+# The static library's name varies by zlib version / port (libzs.lib for vcpkg's zlib 1.4).
+find_library(PEGGLE2_ZLIB_LIB NAMES libzs zs zlibstatic zlib PATHS "${PEGGLE2_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+if (EXISTS "${PEGGLE2_FFMPEG_ROOT}/include/zlib.h" AND PEGGLE2_ZLIB_LIB)
+    target_compile_definitions(Peggle2 PRIVATE PEGGLE2_HAVE_ZLIB)
+    target_include_directories(Peggle2 PRIVATE ${PEGGLE2_FFMPEG_ROOT}/include)
+    target_link_libraries(Peggle2 PRIVATE ${PEGGLE2_ZLIB_LIB})
+    message(STATUS "zlib found (${PEGGLE2_ZLIB_LIB}): native inflate enabled")
+else()
+    message(STATUS "zlib not found (${PEGGLE2_FFMPEG_ROOT}): the title's own zlib is used")
 endif()
 
 # DXC runtime (loaded by xenos_shader.cpp) next to the executable.

@@ -122,6 +122,8 @@ namespace
         float peak = 0;                              // decoded peak since the last log (debugging)
         uint32_t switches = 0, seeks = 0, reopens = 0, restarts = 0, loopsTaken = 0;
         uint32_t lastWrite = 0xFFFFFFFF;             // output write offset we last left
+        bool loggedBadOffset = false;                // diagnostic: out-of-range ring offsets seen
+        uint32_t outputRevoked = 0;                  // output buffer invalidated by the title mid-tick
         bool ended = false;                          // input ran out (next valid input = new sound)
         uint32_t lastLoop[3] = {};                   // loop count, start, end seen (debugging)
         // Frame-accurate position since the decoder (re)started at startBit: samples to drop
@@ -279,12 +281,22 @@ namespace
         }
         uint32_t current = Bits(d[4], 31, 1);
         uint32_t write = Bits(d[0], 27, 5), read = Bits(d[9], 0, 5);
+        // Diagnostic (sound-engine heap corruption hunt): offsets outside the ring would make
+        // the block copy below write past the end of the output buffer.
+        if (write >= blocks || read >= blocks)
+        {
+            if (!h.loggedBadOffset)
+                Log("[xma] context 0x%08X: offsets out of range (write %u, read %u, ring %u blocks at phys 0x%08X)",
+                    addr, write, read, blocks, outPtr);
+            h.loggedBadOffset = true;
+        }
         if (h.lastWrite != 0xFFFFFFFF && write != h.lastWrite) { Restart(h); h.restarts++; }   // ring reset by the title
         if (h.ended && Bits(d[0], current ? 21 : 20, 1)) { Restart(h); h.ended = false; }      // new input after the end
         h.lastLoop[0] = Bits(d[0], 12, 8);
         h.lastLoop[1] = Bits(d[3], 0, 26);
         h.lastLoop[2] = Bits(d[4], 0, 26);
         bool changed = false;
+        const uint32_t revokedBefore = h.outputRevoked;
         for (;;)
         {
             // Free blocks in the ring (write == read means empty).
@@ -292,6 +304,16 @@ namespace
             uint32_t freeBlocks = blocks - 1 - used;
             while (freeBlocks && h.pending.size() >= kBlockBytes)
             {
+                // The title may invalidate the output buffer (and free it) at any time from its
+                // own threads: re-check right before every write instead of trusting the snapshot.
+                uint32_t live1 = Load32(addr + 4), live7 = Load32(addr + 28);
+                if (!Bits(live1, 31, 1) || live7 != outPtr || Bits(Load32(addr), 22, 5) != blocks)
+                {
+                    h.outputRevoked++;
+                    freeBlocks = 0;
+                    changed = false;
+                    break;
+                }
                 memcpy(GuestPtr(0xA0000000u | (outPtr + write * kBlockBytes)), h.pending.data(), kBlockBytes);
                 h.pending.erase(h.pending.begin(), h.pending.begin() + kBlockBytes);
                 write = (write + 1) % blocks;
@@ -398,6 +420,7 @@ namespace
             changed = true;
         }
         h.lastWrite = write;
+        if (h.outputRevoked != revokedBefore) { Restart(h); return; }   // title took the buffer away: write nothing back
         if (!changed) return;
 
         // Write back only what the decoder changed, and only where the title hasn't written since
@@ -421,10 +444,24 @@ namespace
 }
 
 // Called by the audio driver thread once per tick with the live contexts.
-void XmaTick(const std::vector<uint32_t>& contexts)
+// The decoder lock is held for the whole tick, and the live list is taken under it, so a
+// context that XMAReleaseContext removed (holding this lock too) is never touched again: the
+// title frees its buffers right after releasing it.
+std::mutex& XmaDecoderLock()
+{
+#ifdef PEGGLE2_HAVE_FFMPEG
+    return g_lock;
+#else
+    static std::mutex m;   // no decoder: nothing to wait for
+    return m;
+#endif
+}
+
+void XmaTick()
 {
 #ifdef PEGGLE2_HAVE_FFMPEG
     std::lock_guard<std::mutex> g(g_lock);
+    const std::vector<uint32_t> contexts = LiveXmaContexts();
     for (uint32_t c : contexts)
     {
         auto& h = g_host[c];
@@ -437,8 +474,8 @@ void XmaTick(const std::vector<uint32_t>& contexts)
         nextLog += std::chrono::seconds(10);
         for (auto& [c, h] : g_host)
             if (h->packets)
-                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, map check %u/%u bad, loop count %u start %u end %u",
-                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken, h->checkMismatches, h->checkedPackets,
+                Log("[xma] ctx %08X: %u Hz %u ch, %llu packets, peak %.3f, %u switches, %u seeks, %u restarts, %u reopens, %u loops taken, %u revoked, map check %u/%u bad, loop count %u start %u end %u",
+                    c, h->rate, h->channels, (unsigned long long)h->packets, h->peak, h->switches, h->seeks, h->restarts, h->reopens, h->loopsTaken, h->outputRevoked, h->checkMismatches, h->checkedPackets,
                     h->lastLoop[0], h->lastLoop[1], h->lastLoop[2]), h->peak = 0;
     }
     // Forget decoders of released contexts.
@@ -447,8 +484,6 @@ void XmaTick(const std::vector<uint32_t>& contexts)
         if (std::find(contexts.begin(), contexts.end(), it->first) == contexts.end()) it = g_host.erase(it);
         else ++it;
     }
-#else
-    (void)contexts;
 #endif
 }
 

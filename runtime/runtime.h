@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -102,7 +103,9 @@ struct GuestTextureInfo
 };
 
 // XMA decoder emulation (xma.cpp): decode the live contexts once per audio tick.
-void XmaTick(const std::vector<uint32_t>& contexts);
+void XmaTick();                              // decode all live contexts (audio driver thread)
+std::mutex& XmaDecoderLock();
+std::vector<uint32_t> LiveXmaContexts();     // audio.cpp
 uint64_t XmaPacketsDecoded();
 
 // Save a shader container found at a guest address (gpu.cpp). Returns false if it isn't one.

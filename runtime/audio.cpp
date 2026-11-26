@@ -153,7 +153,7 @@ namespace
                 std::lock_guard<std::mutex> g(g_lock);
                 clients = g_clients;
             }
-            XmaTick(LiveXmaContexts());   // hardware XMA decoding, before the clients mix
+            XmaTick();   // hardware XMA decoding, before the clients mix
             for (auto& c : clients)
             {
                 if (!c.active) continue;
@@ -262,11 +262,6 @@ namespace
     std::mutex g_xmaLock;
     std::vector<uint32_t> g_xmaContexts;   // guest addresses of live contexts
 
-    std::vector<uint32_t> LiveXmaContexts()
-    {
-        std::lock_guard<std::mutex> g(g_xmaLock);
-        return g_xmaContexts;
-    }
 
     // Debugging aid: the live contexts' 10 dwords (Xenia's XMA_CONTEXT_DATA layout).
     void LogXmaContexts()
@@ -286,6 +281,12 @@ namespace
     }
 }
 
+std::vector<uint32_t> LiveXmaContexts()
+{
+    std::lock_guard<std::mutex> g(g_xmaLock);
+    return g_xmaContexts;
+}
+
 IMPORT(XMACreateContext)
 {
     uint32_t c = AllocPhysical(0x40, 0x40);
@@ -300,6 +301,7 @@ IMPORT(XMACreateContext)
 }
 IMPORT(XMAReleaseContext)
 {
+    std::lock_guard<std::mutex> d(XmaDecoderLock());   // wait out a tick that may be writing to it
     std::lock_guard<std::mutex> g(g_xmaLock);
     g_xmaContexts.erase(std::remove(g_xmaContexts.begin(), g_xmaContexts.end(), ctx.r3.u32), g_xmaContexts.end());
     ctx.r3.u64 = 0;
