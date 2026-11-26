@@ -257,6 +257,24 @@ bool CopyGuestDxtBlocks(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPit
     return true;
 }
 
+// 8-bit textures (the movie's Y/U/V planes) copied as they are, for an R8 upload: a quarter of
+// the bytes of the RGBA8 expansion, and the fetch swizzle becomes the view's mapping. Linear,
+// no byte swapping only (what the movies use); anything else takes the decode path.
+bool GuestR8Uploadable(const GuestTextureInfo& t) { return t.format == 2 && !t.tiled && t.endian == 0; }
+
+bool CopyGuestR8(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPitch, const uint8_t* snapshot, size_t snapshotSize)
+{
+    if (!GuestR8Uploadable(t)) return false;
+    uint32_t pitch = std::max<uint32_t>(t.pitch ? t.pitch : t.width, t.width);
+    uint64_t footprint = uint64_t(t.height - 1) * pitch + t.width;
+    const uint8_t* base = nullptr;
+    if (snapshot) base = footprint <= snapshotSize ? snapshot : nullptr;
+    else if (uint64_t(t.address) + footprint <= 0xC0000000ull) base = (const uint8_t*)GuestPtr(t.address);
+    if (!base) return false;
+    for (uint32_t y = 0; y < t.height; y++) memcpy(dst + size_t(y) * dstPitch, base + size_t(y) * pitch, t.width);
+    return true;
+}
+
 // Bytes of guest memory mip 0 occupies (tiled textures: width and height padded to 32 blocks).
 bool GuestTextureFootprint(const GuestTextureInfo& t, uint32_t& bytes)
 {
@@ -312,6 +330,14 @@ namespace
     // On-screen timing (DXGI frame statistics): for each present, the display refresh it appeared
     // on. New frames should appear every 2 refreshes at 30 fps; 3 or more is a visible hitch.
     // This is what the player sees, unlike the CPU-side present times above.
+    // A new frame is a hitch when it reaches the screen later than the frame rate allows: 3+
+    // refreshes at 30 fps (frames every 2), 2+ in 60 fps mode (frames every refresh).
+    UINT HitchGap()
+    {
+        static const UINT gap = (getenv("PEGGLE2_60FPS") && atoi(getenv("PEGGLE2_60FPS")) != 0) ? 2 : 3;
+        return gap;
+    }
+
     struct DisplayStats
     {
         UINT lastPresentCount = 0, lastRefresh = 0;
@@ -327,11 +353,11 @@ namespace
             {
                 UINT gap = st.PresentRefreshCount - lastRefresh;
                 gaps[std::min<UINT>(gap, 6) - 1]++;
-                if (gap >= 3) secHitches++;
+                if (gap >= HitchGap()) secHitches++;
                 secWorstGap = std::max<uint32_t>(secWorstGap, gap);
                 static int logged = 0;
                 static const auto start = std::chrono::steady_clock::now();
-                if (gap >= 3 && logged++ < 60)
+                if (gap >= HitchGap() && logged++ < 60)
                     Log("[frames] on-screen hitch: present %u shown %u refreshes after the previous (%.1f s after start)", st.PresentCount, gap,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
             }
@@ -343,10 +369,10 @@ namespace
             char buf[256];
             uint64_t n = 0, hitches = 0;
             for (int i = 0; i < 6; i++) n += gaps[i];
-            for (int i = 2; i < 6; i++) hitches += gaps[i];
-            snprintf(buf, sizeof(buf), "on screen: %llu frames, every 1 refresh %llu, 2 refreshes %llu, 3: %llu, 4: %llu, 5+: %llu; hitches (3+) %llu%s",
+            for (int i = int(HitchGap()) - 1; i < 6; i++) hitches += gaps[i];
+            snprintf(buf, sizeof(buf), "on screen: %llu frames, every 1 refresh %llu, 2 refreshes %llu, 3: %llu, 4: %llu, 5+: %llu; hitches (%u+) %llu%s",
                      (unsigned long long)n, (unsigned long long)gaps[0], (unsigned long long)gaps[1], (unsigned long long)gaps[2],
-                     (unsigned long long)gaps[3], (unsigned long long)(gaps[4] + gaps[5]), (unsigned long long)hitches,
+                     (unsigned long long)gaps[3], (unsigned long long)(gaps[4] + gaps[5]), HitchGap(), (unsigned long long)hitches,
                      unavailable ? " (statistics unavailable for some presents)" : "");
             for (auto& g : gaps) g = 0;
             unavailable = 0;

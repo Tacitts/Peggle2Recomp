@@ -222,56 +222,109 @@ namespace
         list->ResourceBarrier(1, &b);
     }
 
-    // Upload RGBA8 texels into a new texture (copy recorded into `list`).
-    ID3D12Resource* UploadTexture(ID3D12GraphicsCommandList* list, FrameResources& f, const std::vector<uint32_t>& rgba, uint32_t w, uint32_t h)
+    // ---- Texture uploads ------------------------------------------------------------------
+    // Staging comes from the frame's upload ring (a separate buffer only when the ring is full),
+    // and a texture whose content changed is re-filled in place when its size and format are
+    // unchanged. Movies change their planes every frame: creating and releasing a texture and a
+    // staging buffer per plane per frame cost about 15% of the render thread in the intro.
+    constexpr D3D12_RESOURCE_STATES kSrvState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    struct Staging { ID3D12Resource* buffer = nullptr; uint64_t offset = 0; uint8_t* cpu = nullptr; };
+
+    bool Stage(FrameResources& f, uint64_t size, Staging& s)
     {
-        ID3D12Resource* tex = CreateTexture(w, h);
-        if (!tex) return nullptr;
-        uint32_t pitch = (w * 4 + 255) & ~255u;
-        ID3D12Resource* up = CreateBuffer(uint64_t(pitch) * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!up) { tex->Release(); return nullptr; }
+        uint64_t va;
+        if (uint8_t* p = Alloc(f, size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, va))
+        {
+            s = { f.upload, va - f.gpu, p };
+            return true;
+        }
+        ID3D12Resource* up = CreateBuffer(size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!up) return false;
+        f.release.push_back(up);
         uint8_t* p = nullptr;
-        up->Map(0, nullptr, (void**)&p);
-        for (uint32_t y = 0; y < h; y++) memcpy(p + size_t(y) * pitch, rgba.data() + size_t(y) * w, size_t(w) * 4);
-        up->Unmap(0, nullptr);
+        up->Map(0, nullptr, (void**)&p);   // upload heaps may stay mapped
+        s = { up, 0, p };
+        return true;
+    }
+
+    // The texture to copy into: `reuse` when it has this size and format (moved to COPY_DEST),
+    // otherwise a new one (created in COPY_DEST).
+    ID3D12Resource* CopyTarget(ID3D12GraphicsCommandList* list, ID3D12Resource* reuse, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool& reused)
+    {
+        reused = false;
+        if (reuse)
+        {
+            D3D12_RESOURCE_DESC d = reuse->GetDesc();
+            if (d.Width == w && d.Height == h && d.Format == fmt)
+            {
+                Barrier(list, reuse, kSrvState, D3D12_RESOURCE_STATE_COPY_DEST);
+                reused = true;
+                return reuse;
+            }
+        }
+        return CreateTexture(w, h, fmt);
+    }
+
+    void FinishCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* tex, const Staging& s, DXGI_FORMAT fmt, uint32_t w, uint32_t h, uint32_t pitch)
+    {
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
         dst.pResource = tex;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.pResource = up;
+        src.pResource = s.buffer;
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, pitch };
+        src.PlacedFootprint.Offset = s.offset;
+        src.PlacedFootprint.Footprint = { fmt, w, h, 1, pitch };
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        Barrier(list, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        f.release.push_back(up);
+        Barrier(list, tex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState);
+    }
+
+    // Upload RGBA8 texels (copy recorded into `list`).
+    ID3D12Resource* UploadTexture(ID3D12GraphicsCommandList* list, FrameResources& f, const std::vector<uint32_t>& rgba, uint32_t w, uint32_t h,
+                                  ID3D12Resource* reuse, bool& reused)
+    {
+        uint32_t pitch = (w * 4 + 255) & ~255u;
+        Staging s;
+        if (!Stage(f, uint64_t(pitch) * h, s)) return nullptr;
+        for (uint32_t y = 0; y < h; y++) memcpy(s.cpu + size_t(y) * pitch, rgba.data() + size_t(y) * w, size_t(w) * 4);
+        ID3D12Resource* tex = CopyTarget(list, reuse, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, reused);
+        if (!tex) return nullptr;
+        FinishCopy(list, tex, s, DXGI_FORMAT_R8G8B8A8_UNORM, w, h, pitch);
+        return tex;
+    }
+
+    // 8-bit texture (movie planes) uploaded as R8.
+    ID3D12Resource* UploadR8Texture(ID3D12GraphicsCommandList* list, FrameResources& f, const GuestTextureInfo& t,
+                                    const uint8_t* snapshot, size_t snapshotSize, ID3D12Resource* reuse, bool& reused)
+    {
+        reused = false;
+        if (!GuestR8Uploadable(t)) return nullptr;
+        uint32_t pitch = (t.width + 255) & ~255u;
+        Staging s;
+        if (!Stage(f, uint64_t(pitch) * t.height, s)) return nullptr;
+        if (!CopyGuestR8(t, s.cpu, pitch, snapshot, snapshotSize)) return nullptr;
+        ID3D12Resource* tex = CopyTarget(list, reuse, t.width, t.height, DXGI_FORMAT_R8_UNORM, reused);
+        if (!tex) return nullptr;
+        FinishCopy(list, tex, s, DXGI_FORMAT_R8_UNORM, t.width, t.height, pitch);
         return tex;
     }
 
     // DXT texture uploaded as BC1/2/3 (no CPU decode, a quarter of the RGBA8 upload or less).
     ID3D12Resource* UploadDxtTexture(ID3D12GraphicsCommandList* list, FrameResources& f, const GuestTextureInfo& t,
-                                     const uint8_t* snapshot, size_t snapshotSize)
+                                     const uint8_t* snapshot, size_t snapshotSize, ID3D12Resource* reuse, bool& reused)
     {
+        reused = false;
         uint32_t bpb;
         if (!GuestDxtUploadable(t, bpb)) return nullptr;
         DXGI_FORMAT fmt = bpb == 8 ? DXGI_FORMAT_BC1_UNORM : (t.format == 19 || t.format == 53) ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
         uint32_t bw = t.width / 4, bh = t.height / 4;
         uint32_t pitch = (bw * bpb + 255) & ~255u;
-        ID3D12Resource* up = CreateBuffer(uint64_t(pitch) * bh, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!up) return nullptr;
-        uint8_t* p = nullptr;
-        up->Map(0, nullptr, (void**)&p);
-        bool ok = CopyGuestDxtBlocks(t, p, pitch, snapshot, snapshotSize);
-        up->Unmap(0, nullptr);
-        ID3D12Resource* tex = ok ? CreateTexture(t.width, t.height, fmt) : nullptr;
-        if (!tex) { up->Release(); return nullptr; }
-        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-        dst.pResource = tex;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.pResource = up;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint = { fmt, t.width, t.height, 1, pitch };
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        Barrier(list, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        f.release.push_back(up);
+        Staging s;
+        if (!Stage(f, uint64_t(pitch) * bh, s)) return nullptr;
+        if (!CopyGuestDxtBlocks(t, s.cpu, pitch, snapshot, snapshotSize)) return nullptr;
+        ID3D12Resource* tex = CopyTarget(list, reuse, t.width, t.height, fmt, reused);
+        if (!tex) return nullptr;
+        FinishCopy(list, tex, s, fmt, t.width, t.height, pitch);
         return tex;
     }
 
@@ -398,26 +451,31 @@ namespace
             it->second.lastFrame = g_frameCounter;
             return it->second.cpuSrv;
         }
-        // DXT: upload the blocks as they are; the fetch swizzle becomes the view's mapping
-        // (decoded DXT texels are x, y, z, w = R, G, B, A, as ApplySwizzle maps them).
-        bool native = false;
-        ID3D12Resource* tex = UploadDxtTexture(list, fr, t, content ? content->data.data() : nullptr, content ? content->data.size() : 0);
+        // DXT and 8-bit: upload the data as it is; the fetch swizzle becomes the view's mapping
+        // (decoded DXT texels are x, y, z, w = R, G, B, A, as ApplySwizzle maps them; an R8 view
+        // reads x = the byte, y = z = 0, w = 1, as ApplySwizzle's format-2 mapping does).
+        ID3D12Resource* reuse = it != g_textures.end() ? it->second.resource : nullptr;
+        bool reused = false, native = false;
+        const uint8_t* snapData = content ? content->data.data() : nullptr;
+        size_t snapSize = content ? content->data.size() : 0;
+        ID3D12Resource* tex = UploadDxtTexture(list, fr, t, snapData, snapSize, reuse, reused);
+        if (!tex) tex = UploadR8Texture(list, fr, t, snapData, snapSize, reuse, reused);
         if (tex) native = true;
         else
         {
-            std::vector<uint32_t> px;
-            if (!DecodeGuestTexture(t, px, content ? content->data.data() : nullptr, content ? content->data.size() : 0))
+            static std::vector<uint32_t> px;   // render thread only: kept to avoid a large allocation per upload
+            if (!DecodeGuestTexture(t, px, snapData, snapSize))
             {
                 static int logged = 0;
                 if (logged++ < 20) Log("[draw] texture format %u (%ux%u) not decoded", t.format, t.width, t.height);
                 return 0;
             }
             ApplySwizzle(px, t.format, swizzle);
-            tex = UploadTexture(list, fr, px, t.width, t.height);
+            tex = UploadTexture(list, fr, px, t.width, t.height, reuse, reused);
         }
         if (!tex) return 0;
         CachedTexture& c = g_textures[key];
-        if (c.resource) fr.release.push_back(c.resource);
+        if (c.resource && !reused) fr.release.push_back(c.resource);
         else
         {
             if (!g_cpuSrvFree.empty()) { c.cpuSrv = g_cpuSrvFree.back(); g_cpuSrvFree.pop_back(); }

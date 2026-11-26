@@ -1,4 +1,4 @@
-﻿// Xenos draw translation: types shared by the command processor (gpu.cpp), the shader
+// Xenos draw translation: types shared by the command processor (gpu.cpp), the shader
 // translator (xenos_shader.cpp) and the D3D12 draw executor (draw.cpp).
 #pragma once
 
@@ -119,6 +119,8 @@ bool GuestTextureFootprint(const GuestTextureInfo& t, uint32_t& bytes);
 // (rows of `dstPitch` bytes), byte order fixed. False if the texture can't go this way
 // (not DXT, size not a multiple of 4, byte order 8in32/16in32, footprint not readable).
 bool CopyGuestDxtBlocks(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPitch, const uint8_t* snapshot, size_t snapshotSize);
+bool GuestR8Uploadable(const GuestTextureInfo& t);
+bool CopyGuestR8(const GuestTextureInfo& t, uint8_t* dst, uint32_t dstPitch, const uint8_t* snapshot, size_t snapshotSize);
 bool GuestDxtUploadable(const GuestTextureInfo& t, uint32_t& bytesPerBlock);
 
 // Texture memory copied when a draw is recorded (the title may overwrite it right after the

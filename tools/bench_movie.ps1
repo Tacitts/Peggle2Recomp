@@ -19,7 +19,7 @@ for ($i = 1; $i -le $Runs; $i++) {
     Start-Sleep -Milliseconds 300
     $windows = @()
     foreach ($l in Get-Content (Join-Path $runDir 'peggle2_runtime.log')) {
-        if ($l -match '\[frames\] on screen: (\d+) frames.*hitches \(3\+\) (\d+)') {
+        if ($l -match '\[frames\] on screen: (\d+) frames.*hitches \(\d\+\) (\d+)') {
             $windows += ('{0} hitches in {1} frames' -f $Matches[2], $Matches[1])
             $all += [int]$Matches[2]
         }
