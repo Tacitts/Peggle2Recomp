@@ -308,6 +308,12 @@ namespace
     FrameHist g_renderWorkHist;         // PresentFrame CPU time (includes the Present() wait)
     std::atomic<bool> g_ready{ false };
 
+    // PEGGLE2_CAPTURE_TITLE=<png path>: the launcher's art capture. The game runs hidden and muted
+    // with no input; the frame where its title screen shows (750, about 25 s in) is saved to that
+    // path at 1280x720 and the process exits. The art comes from the player's own copy.
+    const char* g_captureTitle = getenv("PEGGLE2_CAPTURE_TITLE");
+    constexpr uint64_t kTitleFrame = 750;
+
     // Texture preview: latest texture from the game, and one upload buffer per back buffer
     // (persistently mapped; 1280x720 BGRA8, row pitch 5120 is already 256-byte aligned).
     GuestTextureInfo g_pendingPreview{};
@@ -528,7 +534,6 @@ namespace
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.lpszClassName = L"Peggle2Recomp";
-        RegisterClassW(&wc);
         // Client size: the launcher's choice (16:9), or the largest 16:9 size that fits 85% of the
         // chosen monitor's work area; centred on that monitor.
         const Settings& set = GetSettings();
@@ -537,16 +542,19 @@ namespace
         LONG workW = mi.rcWork.right - mi.rcWork.left, workH = mi.rcWork.bottom - mi.rcWork.top;
         LONG cw = set.windowWidth > 0 ? set.windowWidth : std::min<LONG>(workW * 85 / 100, workH * 85 / 100 * 16 / 9);
         cw = std::max<LONG>(cw, 640);
+        if (g_captureTitle) cw = LONG(kWidth);   // art capture: native 1280x720
         LONG ch = cw * 9 / 16;
         RECT r{ 0, 0, cw, ch };
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         LONG ww = r.right - r.left, wh = r.bottom - r.top;
         LONG x = mi.rcWork.left + std::max<LONG>(0, (workW - ww) / 2), y = mi.rcWork.top + std::max<LONG>(0, (workH - wh) / 2);
-        g_hwnd = CreateWindowW(wc.lpszClassName, L"Peggle 2 (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));   // icon built from the game's logo, if present
+        RegisterClassW(&wc);
+        g_hwnd = CreateWindowW(wc.lpszClassName, L"Peggle 2", WS_OVERLAPPEDWINDOW | (g_captureTitle ? 0 : WS_VISIBLE),
                                x, y, ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd) { Log("[render] CreateWindow failed (%lu)", GetLastError()); return false; }
-        g_showFps = set.fpsCounter;
-        g_showPerf = set.perfOverlay;
+        g_showFps = set.fpsCounter && !g_captureTitle;
+        g_showPerf = set.perfOverlay && !g_captureTitle;
 
         IDXGIFactory4* factory = nullptr;
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) { Log("[render] DXGI factory failed"); return false; }
@@ -755,12 +763,19 @@ namespace
         std::filesystem::create_directories("screenshots", ec);
         SYSTEMTIME st;
         GetLocalTime(&st);
-        char path[96];
+        char path[512];
         snprintf(path, sizeof(path), "screenshots/peggle2_%04u%02u%02u-%02u%02u%02u-%03u.png", st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        if (g_captureTitle) snprintf(path, sizeof(path), "%s", g_captureTitle);
         WritePng(path, (const uint32_t*)p, g_bbW, g_bbH, pitch / 4);
         readback->Unmap(0, nullptr);
         Log("[render] screenshot saved to %s", path);
+        if (g_captureTitle)
+        {
+            Log("[render] title art captured: exiting");
+            LogFlush();
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
     }
 
     void PresentFrame(uint64_t frame, const GuestTextureInfo* preview)
@@ -902,6 +917,7 @@ namespace
             g_list->CopyTextureRegion(&dst, px, py, 0, &src, &box);
         }
         bool shot = g_screenshotRequested.exchange(false);
+        if (g_captureTitle && frame == kTitleFrame) shot = true;
         if (auto it = std::find(g_screenshotFrames.begin(), g_screenshotFrames.end(), frame); it != g_screenshotFrames.end())
         {
             g_screenshotFrames.erase(it);
@@ -1018,7 +1034,7 @@ namespace
         NameHostThread("render");
         if (!CreateWindowAndDevice()) return;
         g_ready = true;
-        if (GetSettings().fullscreen) ToggleFullscreen(g_hwnd);
+        if (GetSettings().fullscreen && !g_captureTitle) ToggleFullscreen(g_hwnd);
         std::thread(VblankThread).detach();
         auto lastTitle = std::chrono::steady_clock::now();
         uint64_t lastFrames = 0;
@@ -1097,8 +1113,11 @@ namespace
             {
                 double secs = std::chrono::duration<double>(now - lastTitle).count();
                 wchar_t title[160];
-                swprintf(title, 160, L"Peggle 2 (recomp)  -  frame %llu  -  %.0f fps  -  %hs",
-                         (unsigned long long)frame, double(frame - lastFrames) / secs, g_previewDesc);
+                if (g_showFps || g_showPerf || getenv("PEGGLE2_DEBUG_TITLE"))
+                    swprintf(title, 160, L"Peggle 2  -  %.0f fps  -  frame %llu  -  %hs", double(frame - lastFrames) / secs,
+                             (unsigned long long)frame, g_previewDesc);
+                else
+                    swprintf(title, 160, L"Peggle 2");
                 SetWindowTextW(g_hwnd, title);
                 lastTitle = now;
                 lastFrames = frame;

@@ -58,6 +58,13 @@ written by `xexdump --dump-image`.
 game. Everything is saved to `peggle2_settings.ini` next to the program, a plain-text file that can
 also be edited by hand. Only automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`) skip it.
 
+The launcher's art comes from your own copy of the game; none is stored in this repository or
+generated. On first start the launcher runs the game hidden and muted to its title screen and keeps
+that frame (`userdata\launcher_title.png`, "Recapture title art" on the About page redoes it); until
+then it shows the package's banner logo. The executable's icon is built from the package's 64x64
+dashboard logo (`game\SmallLogo.png`, wrapped by `tools/make_icon.py` at build time); without the
+game files the build simply has no icon.
+
 - **Play:** install the game from your own Xbox Live Arcade package (the title ID is checked; the
   files go to `game\` next to the program), full game or trial.
 - **Display:** fullscreen (F11 or Alt+Enter while playing), monitor, window size (or fit to the

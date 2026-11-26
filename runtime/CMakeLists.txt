@@ -103,6 +103,25 @@ else()
     message(STATUS "zlib not found (${PEGGLE2_FFMPEG_ROOT}): the title's own zlib is used")
 endif()
 
+# Icon: built from the player's own game files (the XBLA package's 64x64 dashboard logo, extracted
+# to game/SmallLogo.png). No art is kept in this repository; without the file there is no icon.
+set(PEGGLE2_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../game/SmallLogo.png" CACHE FILEPATH "PNG to build the executable icon from")
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (EXISTS "${PEGGLE2_ICON_SOURCE}" AND Python3_Interpreter_FOUND)
+    enable_language(RC)
+    set(PEGGLE2_ICO "${CMAKE_CURRENT_BINARY_DIR}/peggle2.ico")
+    add_custom_command(OUTPUT ${PEGGLE2_ICO}
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/make_icon.py ${PEGGLE2_ICON_SOURCE} ${PEGGLE2_ICO}
+        DEPENDS ${PEGGLE2_ICON_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/make_icon.py
+        COMMENT "Building the icon from the game's logo")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/peggle2_icon.rc "1 ICON \"peggle2.ico\"\n")
+    set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/peggle2_icon.rc PROPERTIES OBJECT_DEPENDS ${PEGGLE2_ICO})
+    target_sources(Peggle2 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/peggle2_icon.rc)
+    message(STATUS "Icon: from ${PEGGLE2_ICON_SOURCE}")
+else()
+    message(STATUS "Icon: none (game/SmallLogo.png not found)")
+endif()
+
 # DXC runtime (loaded by xenos_shader.cpp) next to the executable.
 add_custom_command(TARGET Peggle2 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XENOS}/thirdparty/dxc-bin/bin/x64/dxcompiler.dll $<TARGET_FILE_DIR:Peggle2>

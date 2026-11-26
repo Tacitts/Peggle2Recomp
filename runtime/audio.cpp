@@ -142,7 +142,7 @@ namespace
         PPCContext ctx{};
         InitGuestThread(ctx, 0x10000, 0xA0D10);   // runtime-owned "audio driver" thread
         Log("[audio] driver thread started (frame every %.2f ms)", kFramePeriod.count() / 1e6);
-        std::thread(WasapiThread).detach();
+        if (!getenv("PEGGLE2_CAPTURE_TITLE")) std::thread(WasapiThread).detach();   // art capture runs muted
         auto next = std::chrono::steady_clock::now();
         auto nextPeakLog = next + std::chrono::seconds(10);
         for (;;)

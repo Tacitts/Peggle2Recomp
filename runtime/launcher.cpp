@@ -1,6 +1,10 @@
-// Launcher: a settings window shown before the game starts (settings.h). Plain Win32 controls
-// (common controls v6), no extra dependencies. One executable: it opens every time, and Play starts
-// the game in the same process. Returns whether to start the game.
+// Launcher: a settings window shown before the game starts (settings.h). One executable: it opens
+// every time, and Play starts the game in the same process. Returns whether to start the game.
+//
+// Look: dark window with the game's title screen across the top (captured from the player's own
+// copy by a hidden run of the game: PEGGLE2_CAPTURE_TITLE, saved to userdata\launcher_title.png;
+// until then the package's banner logo), a page sidebar with a large Play button, and owner-drawn
+// buttons and checkboxes so the whole window can be dark. Win32 + common controls v6 + WIC only.
 #ifndef UNICODE
 #define UNICODE   // the ListView_/TabCtrl_ macros pick the wide-character messages
 #define _UNICODE
@@ -22,34 +26,52 @@
 #include <shlobj.h>
 #include <commdlg.h>
 #include <wincodec.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "msimg32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 const char* PortVersion();   // updater.cpp
 
 namespace
 {
-    constexpr int kW = 720, kH = 560;           // client size at 96 dpi
-    constexpr int kPageX = 20, kPageY = 44, kPageW = kW - 40, kPageH = kH - 110;
-    enum : int { kIdPlay = 1, kIdQuit = 2, kIdTabs = 3, kIdFirst = 100 };
+    // Layout (96-dpi units): header art across the top, page sidebar on the left, pages on the right.
+    constexpr int kW = 980, kH = 730, kHeaderH = 250, kSideW = 190;
+    constexpr int kPageX = kSideW + 24, kPageY = kHeaderH + 20, kPageW = kW - kPageX - 20, kPageH = kH - kPageY - 16;
+    enum : int { kIdPlay = 1, kIdQuit = 2, kIdNav = 10, kIdFirst = 100 };
 
-    HWND g_wnd = nullptr, g_tabs = nullptr;
-    HFONT g_font = nullptr, g_bold = nullptr;
+    // Colours: dark greys, with the orange and blue of the game's logo as accents.
+    const COLORREF kBg = RGB(24, 24, 30), kSide = RGB(17, 17, 22), kPanel = RGB(24, 24, 30), kText = RGB(236, 236, 242),
+                   kMuted = RGB(150, 150, 165), kAccent = RGB(242, 107, 29), kAccentHot = RGB(255, 136, 64),
+                   kBlue = RGB(44, 143, 214), kControl = RGB(44, 44, 54), kControlHot = RGB(60, 60, 74), kEdge = RGB(70, 70, 86);
+    HBRUSH g_bgBrush = nullptr, g_sideBrush = nullptr, g_controlBrush = nullptr;
+
+    HWND g_wnd = nullptr;
+    HFONT g_font = nullptr, g_bold = nullptr, g_big = nullptr, g_nav = nullptr;
+    std::vector<HWND> g_nav_buttons;
+    int g_page = 0;
+    HWND g_hot = nullptr;   // owner-drawn control under the mouse
     std::vector<HWND> g_pages;
     int g_dpi = 96;
     bool g_play = false;
     LauncherInfo g_info;
+    void StartTitleCapture(bool force);   // below
+    std::vector<HWND> g_notes;            // secondary text (muted colour)
 
     int S(int v) { return MulDiv(v, g_dpi, 96); }   // scale 96-dpi layout units
 
     // Controls bound to settings: refresh() puts the setting into the control, apply() reads it back.
     struct Binding { HWND h; std::function<void()> refresh, apply; };
     std::vector<Binding> g_bindings;
+    std::vector<HWND> g_checks;   // owner-drawn checkboxes
     std::vector<std::function<void(int)>> g_commands;   // id - kIdFirst -> handler(notification)
 
     int NewId(std::function<void(int)> fn)
@@ -82,14 +104,24 @@ namespace
     }
     HWND Note(HWND page, int x, int y, int w, int h, const wchar_t* text)
     {
-        return Make(page, L"STATIC", text, SS_LEFT, x, y, w, h);
+        HWND n = Make(page, L"STATIC", text, SS_LEFT, x, y, w, h);
+        g_notes.push_back(n);
+        return n;
     }
 
+    // Owner-drawn checkbox: its state lives in the window's GWLP_USERDATA (1 = checked).
     void Check(HWND page, int x, int y, int w, const wchar_t* text, bool* value)
     {
-        HWND h = Make(page, L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, x, y, w, 22, NewId(nullptr));
-        g_bindings.push_back({ h, [h, value] { SendMessageW(h, BM_SETCHECK, *value ? BST_CHECKED : BST_UNCHECKED, 0); },
-                               [h, value] { *value = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; } });
+        int id = NewId(nullptr);
+        HWND h = Make(page, L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, x, y, w, 24, id);
+        g_commands[size_t(id - kIdFirst)] = [h](int code) {
+            if (code != BN_CLICKED) return;
+            SetWindowLongPtrW(h, GWLP_USERDATA, !GetWindowLongPtrW(h, GWLP_USERDATA));
+            InvalidateRect(h, nullptr, TRUE);
+        };
+        g_checks.push_back(h);
+        g_bindings.push_back({ h, [h, value] { SetWindowLongPtrW(h, GWLP_USERDATA, *value); InvalidateRect(h, nullptr, TRUE); },
+                               [h, value] { *value = GetWindowLongPtrW(h, GWLP_USERDATA) != 0; } });
     }
 
     template <class T>
@@ -98,6 +130,7 @@ namespace
     {
         Label(page, x, y + 3, labelW, label);
         HWND h = Make(page, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + labelW, y, comboW, 300, NewId(nullptr));
+        SetWindowTheme(h, L"DarkMode_CFD", nullptr);
         for (auto& [text, v] : options) SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)text.c_str());
         g_bindings.push_back({ h,
             [h, value, options] {
@@ -113,7 +146,7 @@ namespace
 
     HWND Button(HWND page, int x, int y, int w, const wchar_t* text, std::function<void()> fn)
     {
-        return Make(page, L"BUTTON", text, BS_PUSHBUTTON | WS_TABSTOP, x, y, w, 26, NewId([fn](int code) { if (code == BN_CLICKED) fn(); }));
+        return Make(page, L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, x, y, w, 28, NewId([fn](int code) { if (code == BN_CLICKED) fn(); }));
     }
 
     void RefreshAll() { for (auto& b : g_bindings) if (b.refresh) b.refresh(); }
@@ -192,8 +225,13 @@ namespace
 
     HWND MakeList(HWND page, int x, int y, int w, int h, std::vector<std::pair<const wchar_t*, int>> cols)
     {
-        HWND lv = Make(page, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, x, y, w, h, NewId(nullptr));
+        HWND lv = Make(page, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, x, y, w, h, NewId(nullptr));
         ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        SetWindowTheme(lv, L"DarkMode_Explorer", nullptr);
+        SetWindowTheme(ListView_GetHeader(lv), L"DarkMode_ItemsView", nullptr);
+        ListView_SetBkColor(lv, kControl);
+        ListView_SetTextBkColor(lv, kControl);
+        ListView_SetTextColor(lv, kText);
         for (size_t i = 0; i < cols.size(); i++)
         {
             LVCOLUMNW c{};
@@ -318,6 +356,7 @@ namespace
             FillPadList();
             ListView_SetItemState(g_padList, row, LVIS_SELECTED, LVIS_SELECTED);
         }));
+        SetWindowTheme(g_padCombo, L"DarkMode_CFD", nullptr);
         SendMessageW(g_padCombo, CB_ADDSTRING, 0, (LPARAM)L"(none)");
         for (int b : kPadButtons) SendMessageW(g_padCombo, CB_ADDSTRING, 0, (LPARAM)W(kButtonNames[b]).c_str());
         Button(p, 598, 226, 72, L"Default", [] { for (int i = 0; i < 16; i++) GetSettings().buttonMap[i] = uint16_t(1u << i); FillPadList(); });
@@ -439,16 +478,17 @@ namespace
         HWND p = NewPage();
         Settings& s = GetSettings();
         Label(p, 0, 0, 600, L"Peggle 2 (recompiled): a native Windows port by static recompilation.", true);
-        Note(p, 440, 74, 240, 20, (L"Version " + W(PortVersion())).c_str());
-        Note(p, 0, 24, 660, 40, L"You need your own copy of the Xbox Live Arcade game. Saves and settings stay on this PC.");
-        Combo<std::string>(p, 0, 74, 160, 200, L"Updates:", &s.updateMode,
+        Note(p, 0, 24, 700, 20, L"You need your own copy of the Xbox Live Arcade game. Saves and settings stay on this PC.");
+        Note(p, 0, 46, 700, 20, (L"Version " + W(PortVersion())).c_str());
+        Combo<std::string>(p, 0, 92, 100, 220, L"Updates:", &s.updateMode,
                            { { L"Ask before updating", "ask" }, { L"Update automatically", "auto" }, { L"Off", "off" } });
-        if (g_info.checkForUpdates) Button(p, 300, 107, 140, L"Check now", [] { ApplyAll(); g_info.checkForUpdates(g_wnd, true); });
+        if (g_info.checkForUpdates) Button(p, 340, 90, 140, L"Check now", [] { ApplyAll(); g_info.checkForUpdates(g_wnd, true); });
         Button(p, 0, 150, 160, L"Open save folder", [] { OpenFolder(PortDir() / "userdata"); });
         Button(p, 170, 150, 160, L"Open game folder", [] { OpenFolder(g_info.gameFound ? g_info.gameDir : PortDir()); });
         Button(p, 340, 150, 160, L"Open logs folder", [] { OpenFolder(PortDir()); });
         Button(p, 510, 150, 160, L"Open crash reports", [] { OpenFolder(PortDir() / "crashes"); });
         Button(p, 0, 186, 160, L"Open settings file", [] { ApplyAll(); SavePortSettings(); ShellExecuteW(nullptr, L"open", L"notepad.exe", SettingsPath().wstring().c_str(), nullptr, SW_SHOWNORMAL); });
+        Button(p, 340, 186, 160, L"Recapture title art", [] { StartTitleCapture(true); });
         Button(p, 170, 186, 160, L"Reset all settings", [] {
             if (MessageBoxW(g_wnd, L"Reset every setting to its default?", L"Peggle 2", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
             ResetPortSettings();
@@ -458,9 +498,266 @@ namespace
         });
     }
 
+    // ---- Art from the player's game ----------------------------------------------------------
+    HBITMAP g_art = nullptr;          // 32-bit top-down DIB
+    int g_artW = 0, g_artH = 0;
+    bool g_artIsBanner = false;       // the package's banner logo (no title capture yet)
+    HANDLE g_capture = nullptr;       // hidden capture run in progress
+    constexpr UINT_PTR kTimerCapture = 1, kTimerHover = 2;
+
+    std::filesystem::path TitleArtPath() { return PortDir() / "userdata" / "launcher_title.png"; }
+
+    HBITMAP LoadImageFile(const std::filesystem::path& path, int& w, int& h)
+    {
+        IWICImagingFactory* f = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) return nullptr;
+        HBITMAP result = nullptr;
+        IWICBitmapDecoder* dec = nullptr;
+        IWICBitmapFrameDecode* frame = nullptr;
+        IWICFormatConverter* conv = nullptr;
+        UINT uw = 0, uh = 0;
+        if (SUCCEEDED(f->CreateDecoderFromFilename(path.wstring().c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
+            SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(frame->GetSize(&uw, &uh)) && SUCCEEDED(f->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        {
+            BITMAPINFO bi{};
+            bi.bmiHeader = { sizeof(BITMAPINFOHEADER), LONG(uw), -LONG(uh), 1, 32, BI_RGB };
+            void* bits = nullptr;
+            result = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (result && FAILED(conv->CopyPixels(nullptr, uw * 4, uw * uh * 4, (BYTE*)bits))) { DeleteObject(result); result = nullptr; }
+            w = int(uw);
+            h = int(uh);
+        }
+        for (IUnknown* u : { (IUnknown*)conv, (IUnknown*)frame, (IUnknown*)dec, (IUnknown*)f })
+            if (u) u->Release();
+        return result;
+    }
+
+    void LoadArt()
+    {
+        if (g_art) DeleteObject(g_art);
+        g_art = nullptr;
+        g_artIsBanner = false;
+        std::error_code ec;
+        if (std::filesystem::exists(TitleArtPath(), ec)) g_art = LoadImageFile(TitleArtPath(), g_artW, g_artH);
+        if (!g_art && g_info.gameFound)
+        {
+            g_art = LoadImageFile(g_info.gameDir / "BannerLogo.png", g_artW, g_artH);
+            g_artIsBanner = g_art != nullptr;
+        }
+    }
+
+    // Run the game hidden and muted to its title screen and save that frame (render.cpp).
+    void StartTitleCapture(bool force)
+    {
+        if (!g_info.gameFound || g_capture) return;
+        std::error_code ec;
+        if (!force && std::filesystem::exists(TitleArtPath(), ec)) return;
+        auto work = PortDir() / "userdata" / "capture";   // its own log and shader cache
+        std::filesystem::create_directories(work, ec);
+        if (force) std::filesystem::remove(TitleArtPath(), ec);
+        wchar_t self[MAX_PATH];
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(self) + L"\" \"" + g_info.gameDir.wstring() + L"\"";
+        SetEnvironmentVariableW(L"PEGGLE2_CAPTURE_TITLE", TitleArtPath().wstring().c_str());
+        STARTUPINFOW si{ sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, work.wstring().c_str(), &si, &pi))
+        {
+            CloseHandle(pi.hThread);
+            g_capture = pi.hProcess;
+            SetTimer(g_wnd, kTimerCapture, 500, nullptr);
+            Log("[launcher] capturing the title screen for the launcher art");
+        }
+        SetEnvironmentVariableW(L"PEGGLE2_CAPTURE_TITLE", nullptr);
+        InvalidateRect(g_wnd, nullptr, FALSE);
+    }
+
+    // ---- Painting --------------------------------------------------------------------------------
+    void FillSolid(HDC dc, RECT r, COLORREF c)
+    {
+        SetBkColor(dc, c);
+        ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
+    }
+
+    void RoundBox(HDC dc, RECT r, COLORREF fill, COLORREF edge, int radius)
+    {
+        HBRUSH b = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, edge);
+        HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, pen);
+        RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(b);
+        DeleteObject(pen);
+    }
+
+    // Vertical fade from transparent to `c` over r (per-pixel alpha, premultiplied).
+    void Fade(HDC dc, RECT r, COLORREF c, bool down)
+    {
+        int w = r.right - r.left, h = r.bottom - r.top;
+        if (w <= 0 || h <= 0) return;
+        BITMAPINFO bi{};
+        bi.bmiHeader = { sizeof(BITMAPINFOHEADER), 1, -h, 1, 32, BI_RGB };
+        uint32_t* px = nullptr;
+        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&px, nullptr, 0);
+        if (!bmp) return;
+        for (int y = 0; y < h; y++)
+        {
+            uint32_t a = uint32_t(255 * (down ? y : h - 1 - y) / std::max(1, h - 1));
+            uint32_t rr = GetRValue(c) * a / 255, gg = GetGValue(c) * a / 255, bb = GetBValue(c) * a / 255;
+            px[y] = a << 24 | rr << 16 | gg << 8 | bb;
+        }
+        HDC mdc = CreateCompatibleDC(dc);
+        HGDIOBJ old = SelectObject(mdc, bmp);
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(dc, r.left, r.top, w, h, mdc, 0, 0, 1, h, bf);
+        SelectObject(mdc, old);
+        DeleteDC(mdc);
+        DeleteObject(bmp);
+    }
+
+    void PaintHeader(HDC dc, RECT hr)
+    {
+        int w = hr.right - hr.left, h = hr.bottom - hr.top;
+        FillSolid(dc, hr, kBg);
+        if (g_art)
+        {
+            HDC mdc = CreateCompatibleDC(dc);
+            HGDIOBJ old = SelectObject(mdc, g_art);
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            if (!g_artIsBanner)
+            {
+                // Title screen: fill the width, show the band around the logo.
+                double scale = double(w) / g_artW;
+                int srcH = std::min(g_artH, int(h / scale));
+                int srcY = std::clamp(int(g_artH * 0.47) - srcH / 2, 0, g_artH - srcH);
+                StretchBlt(dc, hr.left, hr.top, w, h, mdc, 0, srcY, g_artW, srcH, SRCCOPY);
+            }
+            else
+            {
+                // Banner logo on the window colour, centred, as large as the header allows.
+                double scale = std::min(double(w) * 0.6 / g_artW, double(h) * 0.7 / g_artH);
+                int dw = int(g_artW * scale), dh = int(g_artH * scale);
+                BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+                AlphaBlend(dc, hr.left + (w - dw) / 2, hr.top + (h - dh) / 2, dw, dh, mdc, 0, 0, g_artW, g_artH, bf);
+            }
+            SelectObject(mdc, old);
+            DeleteDC(mdc);
+        }
+        Fade(dc, RECT{ hr.left, hr.bottom - S(70), hr.right, hr.bottom }, kBg, true);
+        if (g_capture || !g_info.gameFound)
+        {
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, kMuted);
+            HGDIOBJ of = SelectObject(dc, g_font);
+            const wchar_t* t = g_capture ? L"Preparing the title art from your game..." : L"Install the game to see its art here.";
+            RECT tr{ hr.left, hr.bottom - S(28), hr.right - S(16), hr.bottom - S(6) };
+            DrawTextW(dc, t, -1, &tr, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(dc, of);
+        }
+    }
+
+    bool IsCheck(HWND h) { return std::find(g_checks.begin(), g_checks.end(), h) != g_checks.end(); }
+
+    void DrawOwner(const DRAWITEMSTRUCT* d)
+    {
+        HDC dc = d->hDC;
+        RECT r = d->rcItem;
+        wchar_t text[160] = L"";
+        GetWindowTextW(d->hwndItem, text, 160);
+        bool hot = d->hwndItem == g_hot, pressed = (d->itemState & ODS_SELECTED) != 0, focus = (d->itemState & ODS_FOCUS) != 0;
+        int id = int(d->CtlID);
+        SetBkMode(dc, TRANSPARENT);
+        if (IsCheck(d->hwndItem))
+        {
+            FillSolid(dc, r, kBg);
+            bool on = GetWindowLongPtrW(d->hwndItem, GWLP_USERDATA) != 0;
+            int box = S(18), top = r.top + (r.bottom - r.top - box) / 2;
+            RECT b{ r.left + 1, top, r.left + 1 + box, top + box };
+            RoundBox(dc, b, on ? kAccent : (hot ? kControlHot : kControl), on ? kAccent : kEdge, S(6));
+            if (on)
+            {
+                HPEN pen = CreatePen(PS_SOLID, std::max(2, S(2)), RGB(255, 255, 255));
+                HGDIOBJ op = SelectObject(dc, pen);
+                MoveToEx(dc, b.left + box * 22 / 100, b.top + box * 52 / 100, nullptr);
+                LineTo(dc, b.left + box * 42 / 100, b.top + box * 72 / 100);
+                LineTo(dc, b.left + box * 78 / 100, b.top + box * 30 / 100);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            }
+            SetTextColor(dc, kText);
+            HGDIOBJ of = SelectObject(dc, g_font);
+            RECT tr{ b.right + S(10), r.top, r.right, r.bottom };
+            DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            if (focus) { SetTextColor(dc, kAccent); }
+            SelectObject(dc, of);
+            return;
+        }
+        if (id >= kIdNav && id < kIdNav + 16)   // sidebar page button
+        {
+            bool sel = id - kIdNav == g_page;
+            FillSolid(dc, r, sel ? kControl : (hot ? RGB(30, 30, 38) : kSide));
+            if (sel) FillSolid(dc, RECT{ r.left, r.top + S(6), r.left + S(4), r.bottom - S(6) }, kAccent);
+            SetTextColor(dc, sel ? kText : (hot ? kText : kMuted));
+            HGDIOBJ of = SelectObject(dc, g_nav);
+            RECT tr{ r.left + S(22), r.top, r.right, r.bottom };
+            DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(dc, of);
+            return;
+        }
+        HWND parent = GetParent(d->hwndItem);
+        FillSolid(dc, r, parent == g_wnd ? kSide : kBg);
+        RECT b = r;
+        InflateRect(&b, -1, -1);
+        if (id == kIdPlay)
+        {
+            RoundBox(dc, b, pressed ? kAccent : (hot ? kAccentHot : kAccent), pressed ? kAccent : kAccentHot, S(14));
+            SetTextColor(dc, RGB(255, 255, 255));
+            HGDIOBJ of = SelectObject(dc, g_big);
+            DrawTextW(dc, L"PLAY", -1, &b, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(dc, of);
+            return;
+        }
+        RoundBox(dc, b, pressed ? kControl : (hot ? kControlHot : kControl), focus ? kBlue : kEdge, S(10));
+        SetTextColor(dc, id == kIdQuit ? kMuted : kText);
+        HGDIOBJ of = SelectObject(dc, g_font);
+        DrawTextW(dc, text, -1, &b, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, of);
+    }
+
+    // Track the owner-drawn control under the mouse for hover highlights.
+    void UpdateHover()
+    {
+        POINT pt;
+        GetCursorPos(&pt);
+        HWND h = WindowFromPoint(pt);
+        wchar_t cls[16] = L"";
+        if (h) GetClassNameW(h, cls, 16);
+        bool owner = h && _wcsicmp(cls, L"Button") == 0 && (GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW &&
+                     (GetAncestor(h, GA_ROOT) == g_wnd);
+        HWND now = owner ? h : nullptr;
+        if (now == g_hot) return;
+        HWND was = g_hot;
+        g_hot = now;
+        if (was) InvalidateRect(was, nullptr, FALSE);
+        if (now) InvalidateRect(now, nullptr, FALSE);
+    }
+
     void ShowPage(int i)
     {
+        g_page = i;
         for (size_t k = 0; k < g_pages.size(); k++) ShowWindow(g_pages[k], int(k) == i ? SW_SHOW : SW_HIDE);
+        for (HWND b : g_nav_buttons) InvalidateRect(b, nullptr, FALSE);
+    }
+
+    LRESULT ColorStatic(HWND ctl, HDC dc)
+    {
+        bool note = std::find(g_notes.begin(), g_notes.end(), ctl) != g_notes.end();
+        SetTextColor(dc, note ? kMuted : kText);
+        SetBkColor(dc, kBg);
+        return (LRESULT)g_bgBrush;
     }
 
     LRESULT CALLBACK PageProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -470,7 +767,7 @@ namespace
         case WM_COMMAND:
         {
             int id = LOWORD(wp);
-            if (id >= kIdFirst && id - kIdFirst < int(g_commands.size()) && g_commands[id - kIdFirst]) g_commands[id - kIdFirst](HIWORD(wp));
+            if (id >= kIdFirst && id - kIdFirst < int(g_commands.size()) && g_commands[size_t(id - kIdFirst)]) g_commands[size_t(id - kIdFirst)](HIWORD(wp));
             return 0;
         }
         case WM_NOTIFY:
@@ -489,10 +786,17 @@ namespace
             }
             return 0;
         }
+        case WM_DRAWITEM:
+            DrawOwner((const DRAWITEMSTRUCT*)lp);
+            return TRUE;
         case WM_CTLCOLORSTATIC:
+            return ColorStatic((HWND)lp, (HDC)wp);
         case WM_CTLCOLORBTN:
-            SetBkMode((HDC)wp, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+            return (LRESULT)g_bgBrush;
+        case WM_CTLCOLORLISTBOX:
+            SetTextColor((HDC)wp, kText);
+            SetBkColor((HDC)wp, kControl);
+            return (LRESULT)g_controlBrush;
         }
         return DefWindowProcW(h, msg, wp, lp);
     }
@@ -502,15 +806,54 @@ namespace
         switch (msg)
         {
         case WM_COMMAND:
-            if (LOWORD(wp) == kIdPlay) { ApplyAll(); g_play = true; DestroyWindow(h); return 0; }
-            if (LOWORD(wp) == kIdQuit) { ApplyAll(); g_play = false; DestroyWindow(h); return 0; }
+        {
+            int id = LOWORD(wp);
+            if (id == kIdPlay) { ApplyAll(); g_play = true; DestroyWindow(h); return 0; }
+            if (id == kIdQuit) { ApplyAll(); g_play = false; DestroyWindow(h); return 0; }
+            if (id >= kIdNav && id < kIdNav + int(g_pages.size())) { ShowPage(id - kIdNav); return 0; }
             break;
-        case WM_NOTIFY:
-            if (((NMHDR*)lp)->hwndFrom == g_tabs && ((NMHDR*)lp)->code == TCN_SELCHANGE) ShowPage(TabCtrl_GetCurSel(g_tabs));
-            return 0;
+        }
+        case WM_DRAWITEM:
+            DrawOwner((const DRAWITEMSTRUCT*)lp);
+            return TRUE;
         case WM_CTLCOLORSTATIC:
-            SetBkMode((HDC)wp, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+            return ColorStatic((HWND)lp, (HDC)wp);
+        case WM_CTLCOLORBTN:
+            return (LRESULT)g_sideBrush;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT cr;
+            GetClientRect(h, &cr);
+            // Double-buffered: header art, sidebar, body.
+            HDC mdc = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+            HGDIOBJ old = SelectObject(mdc, bmp);
+            FillSolid(mdc, cr, kBg);
+            PaintHeader(mdc, RECT{ 0, 0, cr.right, S(kHeaderH) });
+            FillSolid(mdc, RECT{ 0, S(kHeaderH), S(kSideW), cr.bottom }, kSide);
+            BitBlt(dc, 0, 0, cr.right, cr.bottom, mdc, 0, 0, SRCCOPY);
+            SelectObject(mdc, old);
+            DeleteObject(bmp);
+            DeleteDC(mdc);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (wp == kTimerHover) UpdateHover();
+            if (wp == kTimerCapture && g_capture && WaitForSingleObject(g_capture, 0) == WAIT_OBJECT_0)
+            {
+                CloseHandle(g_capture);
+                g_capture = nullptr;
+                KillTimer(h, kTimerCapture);
+                LoadArt();
+                InvalidateRect(h, nullptr, FALSE);
+                Log("[launcher] title art %s", g_artIsBanner || !g_art ? "not captured" : "ready");
+            }
+            return 0;
         case WM_CLOSE:
             ApplyAll();
             g_play = false;
@@ -547,15 +890,18 @@ bool LauncherWanted(bool gameFound)
     // The game is always started from the launcher (one executable: launcher, then game).
     // Only automated runs (soak/benchmark scripts, autopress) skip it, and only when the
     // game files are there.
-    if (gameFound && (getenv("PEGGLE2_NO_LAUNCHER") || getenv("PEGGLE2_AUTOPRESS")) && !getenv("PEGGLE2_LAUNCHER")) return false;
+    if (gameFound && (getenv("PEGGLE2_NO_LAUNCHER") || getenv("PEGGLE2_AUTOPRESS") || getenv("PEGGLE2_CAPTURE_TITLE")) &&
+        !getenv("PEGGLE2_LAUNCHER"))
+        return false;
     return true;
 }
 
 bool RunLauncher(const LauncherInfo& info)
 {
     g_info = info;
-    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     HINSTANCE inst = GetModuleHandleW(nullptr);
 
     // Per-monitor DPI for this window only (the game window keeps the process default).
@@ -564,67 +910,86 @@ bool RunLauncher(const LauncherInfo& info)
 
     NONCLIENTMETRICSW ncm{ sizeof(ncm) };
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, UINT(g_dpi));
-    g_font = CreateFontIndirectW(&ncm.lfMessageFont);
-    LOGFONTW bold = ncm.lfMessageFont;
+    LOGFONTW lf = ncm.lfMessageFont;
+    lf.lfHeight = -MulDiv(10, g_dpi, 72);
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(lf.lfFaceName, L"Segoe UI");
+    g_font = CreateFontIndirectW(&lf);
+    LOGFONTW bold = lf;
     bold.lfWeight = FW_SEMIBOLD;
+    bold.lfHeight = -MulDiv(11, g_dpi, 72);
     g_bold = CreateFontIndirectW(&bold);
+    LOGFONTW nav = lf;
+    nav.lfHeight = -MulDiv(12, g_dpi, 72);
+    nav.lfWeight = FW_SEMIBOLD;
+    g_nav = CreateFontIndirectW(&nav);
+    LOGFONTW big = lf;
+    big.lfHeight = -MulDiv(20, g_dpi, 72);
+    big.lfWeight = FW_BOLD;
+    g_big = CreateFontIndirectW(&big);
+    g_bgBrush = CreateSolidBrush(kBg);
+    g_sideBrush = CreateSolidBrush(kSide);
+    g_controlBrush = CreateSolidBrush(kControl);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    wc.hbrBackground = nullptr;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.lpszClassName = L"Peggle2Launcher";
     RegisterClassW(&wc);
     WNDCLASSW pc = wc;
     pc.lpfnWndProc = PageProc;
+    pc.hbrBackground = g_bgBrush;
     pc.lpszClassName = L"Peggle2LauncherPage";
     RegisterClassW(&pc);
 
     RECT r{ 0, 0, S(kW), S(kH) };
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, UINT(g_dpi));
-    g_wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Peggle 2 (recompiled) - Launcher", style,
+    g_wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Peggle 2", style,
                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(g_wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    LoadArt();
 
-    g_tabs = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP, S(10), S(8), S(kW - 20), S(kH - 70),
-                             g_wnd, (HMENU)kIdTabs, inst, nullptr);
-    SendMessageW(g_tabs, WM_SETFONT, (WPARAM)g_font, TRUE);
+    // Sidebar: pages, then Play and Quit at the bottom.
     std::vector<const wchar_t*> names = { L"Play", L"Display", L"Graphics", L"Gameplay", L"Controls", L"Achievements", L"About" };
     for (size_t i = 0; i < names.size(); i++)
     {
-        TCITEMW t{};
-        t.mask = TCIF_TEXT;
-        t.pszText = (LPWSTR)names[i];
-        TabCtrl_InsertItem(g_tabs, int(i), &t);
+        HWND b = CreateWindowExW(0, L"BUTTON", names[i], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, S(kHeaderH + 14 + int(i) * 42), S(kSideW), S(40),
+                                 g_wnd, (HMENU)(INT_PTR)(kIdNav + int(i)), inst, nullptr);
+        g_nav_buttons.push_back(b);
     }
+    HWND play = CreateWindowExW(0, L"BUTTON", L"Play", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(16), S(kH - 16 - 34 - 10 - 58), S(kSideW - 32), S(58), g_wnd, (HMENU)kIdPlay, inst, nullptr);
+    HWND quit = CreateWindowExW(0, L"BUTTON", L"Quit", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(16), S(kH - 16 - 34), S(kSideW - 32), S(34), g_wnd, (HMENU)kIdQuit, inst, nullptr);
+
     BuildPlay();
     BuildDisplay();
     BuildGraphics();
     BuildGameplay();
     BuildControls();
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     BuildAchievements();
     BuildAbout();
-    for (HWND pg : g_pages) SetWindowPos(pg, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     RefreshAll();
     ShowPage(0);
-
-    HWND play = CreateWindowExW(0, L"BUTTON", L"Play", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                S(kW - 230), S(kH - 50), S(105), S(32), g_wnd, (HMENU)kIdPlay, inst, nullptr);
-    HWND quit = CreateWindowExW(0, L"BUTTON", L"Quit", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                S(kW - 115), S(kH - 50), S(105), S(32), g_wnd, (HMENU)kIdQuit, inst, nullptr);
-    SendMessageW(play, WM_SETFONT, (WPARAM)g_font, TRUE);
-    SendMessageW(quit, WM_SETFONT, (WPARAM)g_font, TRUE);
-    EnableWindow(play, TRUE);
 
     ShowWindow(g_wnd, SW_SHOW);
     SetForegroundWindow(g_wnd);
     SetFocus(play);
-    if (g_info.checkForUpdates && !getenv("PEGGLE2_LAUNCHER_SHOT")) g_info.checkForUpdates(g_wnd, false);
+    (void)quit;
+    SetTimer(g_wnd, kTimerHover, 50, nullptr);
+    const char* shot = getenv("PEGGLE2_LAUNCHER_SHOT");
+    if (!shot)
+    {
+        StartTitleCapture(false);   // first start after installing: fetch the art in the background
+        if (g_info.checkForUpdates) g_info.checkForUpdates(g_wnd, false);
+    }
     // PEGGLE2_LAUNCHER_SHOT=<prefix>: save a PNG of every page and close (for checking the layout).
-    if (const char* shot = getenv("PEGGLE2_LAUNCHER_SHOT"))
+    if (shot)
     {
         RECT cr;
         GetClientRect(g_wnd, &cr);
@@ -637,7 +1002,6 @@ bool RunLauncher(const LauncherInfo& info)
         HGDIOBJ old = SelectObject(mdc, bmp);
         for (size_t i = 0; i < g_pages.size(); i++)
         {
-            TabCtrl_SetCurSel(g_tabs, int(i));
             ShowPage(int(i));
             RedrawWindow(g_wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
             PrintWindow(g_wnd, mdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
@@ -663,12 +1027,23 @@ bool RunLauncher(const LauncherInfo& info)
             DispatchMessageW(&m);
         }
     }
+    if (g_capture)   // don't leave a capture run behind
+    {
+        TerminateProcess(g_capture, 1);
+        CloseHandle(g_capture);
+        g_capture = nullptr;
+    }
     SetThreadDpiAwarenessContext(prev);
-    DeleteObject(g_font);
-    DeleteObject(g_bold);
+    for (HGDIOBJ o : { (HGDIOBJ)g_font, (HGDIOBJ)g_bold, (HGDIOBJ)g_nav, (HGDIOBJ)g_big, (HGDIOBJ)g_bgBrush, (HGDIOBJ)g_sideBrush,
+                       (HGDIOBJ)g_controlBrush, (HGDIOBJ)g_art })
+        if (o) DeleteObject(o);
+    g_art = nullptr;
     g_pages.clear();
     g_bindings.clear();
     g_commands.clear();
+    g_checks.clear();
+    g_notes.clear();
+    g_nav_buttons.clear();
     SavePortSettings();
     if (g_play && !g_info.gameFound)
     {
