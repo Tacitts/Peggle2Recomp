@@ -583,6 +583,7 @@ namespace
     constexpr UINT_PTR kTimerCapture = 1, kTimerHover = 2;
 
     std::filesystem::path TitleArtPath() { return PortDir() / "userdata" / "launcher_title.png"; }
+    ULONGLONG g_captureStartTick = 0;   // a capture still running after 90 s is ended (banner art instead)
 
     HBITMAP LoadImageFile(const std::filesystem::path& path, int& w, int& h)
     {
@@ -643,6 +644,7 @@ namespace
         {
             CloseHandle(pi.hThread);
             g_capture = pi.hProcess;
+            g_captureStartTick = GetTickCount64();
             SetTimer(g_wnd, kTimerCapture, 500, nullptr);
             Log("[launcher] capturing the title screen for the launcher art");
         }
@@ -1047,6 +1049,13 @@ namespace
                 bool saved = GetTickCount64() < g_savedUntil;
                 if (wasSaved && !saved) { RECT hint{ S(kPageX), S(kH - 34), S(kW), S(kH) }; InvalidateRect(h, &hint, FALSE); }
                 wasSaved = saved;
+            }
+            if (wp == kTimerCapture && g_capture && WaitForSingleObject(g_capture, 0) != WAIT_OBJECT_0 &&
+                GetTickCount64() - g_captureStartTick > 90000)
+            {
+                Log("[launcher] title capture still running after 90 s: ended");
+                TerminateProcess(g_capture, 1);
+                WaitForSingleObject(g_capture, 5000);
             }
             if (wp == kTimerCapture && g_capture && WaitForSingleObject(g_capture, 0) == WAIT_OBJECT_0)
             {

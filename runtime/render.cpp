@@ -382,10 +382,14 @@ namespace
     std::atomic<bool> g_ready{ false };
 
     // PEGGLE2_CAPTURE_TITLE=<png path>: the launcher's art capture. The game runs hidden and muted
-    // with no input; the frame where its title screen shows (750, about 25 s in) is saved to that
-    // path at 1280x720 and the process exits. The art comes from the player's own copy.
+    // with no input; the first frame presented 30 s or more after start (the title screen, which
+    // waits for a button, shows from about 25 s) is saved to that path at 1280x720 and the process
+    // exits. Not a frame number: presents only show the newest frame, so numbers can be skipped
+    // (an exact-number check then never fired and the launcher waited forever), and they count
+    // present requests, not game time. The art comes from the player's own copy.
     const char* g_captureTitle = getenv("PEGGLE2_CAPTURE_TITLE");
-    constexpr uint64_t kTitleFrame = 750;
+    const auto g_captureStart = std::chrono::steady_clock::now();
+    constexpr auto kTitleAfter = std::chrono::seconds(30);
 
     // Texture preview: latest texture from the game, and one upload buffer per back buffer
     // (persistently mapped; 1280x720 BGRA8, row pitch 5120 is already 256-byte aligned).
@@ -1053,7 +1057,7 @@ namespace
             g_list->CopyTextureRegion(&dst, px, py, 0, &src, &box);
         }
         bool shot = g_screenshotRequested.exchange(false);
-        if (g_captureTitle && frame == kTitleFrame) shot = true;
+        if (g_captureTitle && std::chrono::steady_clock::now() - g_captureStart >= kTitleAfter) shot = true;
         if (auto it = std::find(g_screenshotFrames.begin(), g_screenshotFrames.end(), frame); it != g_screenshotFrames.end())
         {
             g_screenshotFrames.erase(it);
