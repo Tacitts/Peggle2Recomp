@@ -56,7 +56,8 @@ written by `xexdump --dump-image`.
 
 `Peggle2.exe` is both the launcher and the game: it always opens the launcher, and Play starts the
 game. Everything is saved to `peggle2_settings.ini` next to the program, a plain-text file that can
-also be edited by hand. Only automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`) skip it.
+also be edited by hand. Only automated runs (`PEGGLE2_AUTOPRESS`, `PEGGLE2_NO_LAUNCHER`) skip it. It is a Windows program: no console window opens. The log is `peggle2_runtime.log` next to the
+executable (older runs in `logs\`); `PEGGLE2_CONSOLE=1` also shows it in a console window.
 
 The launcher's art comes from your own copy of the game; none is stored in this repository or
 generated. On first start the launcher runs the game hidden and muted to its title screen and keeps

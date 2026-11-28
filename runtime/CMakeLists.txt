@@ -73,6 +73,10 @@ target_compile_definitions(Peggle2 PRIVATE NOMINMAX)
 target_compile_options(Peggle2 PRIVATE /clang:-march=sandybridge -Wno-unused-parameter /Z7)
 set_source_files_properties(xenos_shader.cpp PROPERTIES COMPILE_OPTIONS "/FI${XENOS}/XenosRecomp/pch.h;-Wno-switch")
 target_link_options(Peggle2 PRIVATE /DEBUG)
+# A Windows (GUI) program: no console window opens with the launcher or the game. main() stays
+# the entry point; the log goes to peggle2_runtime.log. PEGGLE2_CONSOLE=1 opens a console for it.
+set_target_properties(Peggle2 PROPERTIES WIN32_EXECUTABLE ON)
+target_link_options(Peggle2 PRIVATE /ENTRY:mainCRTStartup)
 target_link_libraries(Peggle2 PRIVATE Peggle2Recomp XenonUtils XenosShaderRecompiler ws2_32 dbghelp xinput winmm)
 
 # Optional: FFmpeg's libavcodec for XMA audio (xma.cpp), from vcpkg at ../vcpkg next to the repo:

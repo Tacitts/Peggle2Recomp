@@ -730,6 +730,14 @@ static void SpikeProfilerThread()
 
 int main(int argc, char** argv)
 {
+    // Built as a Windows program, so there is no console; PEGGLE2_CONSOLE=1 opens one and shows
+    // the log there too (stdout redirected by a script, as tools/run.ps1 does, works either way).
+    if (const char* c = getenv("PEGGLE2_CONSOLE"); c && *c && *c != '0' && AllocConsole())
+    {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+    }
     // 1 ms timer resolution for the whole run: the GPU thread's idle wait, the audio tick and
     // the guest's own Sleep()s otherwise last a 15.6 ms timer tick, which made frames late.
     timeBeginPeriod(1);
